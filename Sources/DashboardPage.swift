@@ -180,7 +180,7 @@ body.serif .doc { font: 17.5px/1.75 var(--serif); letter-spacing: 0; }
 .doc .cue { display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 8px; margin: 0 0 0.5em; }
 .doc .cue time { font: 500 12px/2.4 var(--ui); color: var(--faint); font-variant-numeric: tabular-nums; user-select: none; -webkit-user-select: none; }
 .doc .cue p { margin: 0; }
-.doc .quiet { color: var(--muted); }
+.doc .quiet, .doc .cue.partial p { color: var(--muted); }
 body.no-time .doc .cue { grid-template-columns: minmax(0, 1fr); }
 body.no-time .doc .cue time { display: none; }
 .doc .sep { display: flex; justify-content: center; margin: 1.4em 0; }
@@ -496,7 +496,8 @@ function markdown(text) {
     } else if ((m = trimmed.match(SEP))) {
       out.push('<div class="sep">' + inline(m[1]) + '</div>'); i++;
     } else if ((m = trimmed.match(CUE))) {
-      out.push('<div class="cue"><time>' + m[1] + '</time><p>' + inline(m[2]) + '</p></div>'); i++;
+      const pending = m[2].endsWith(' …（识别中）');
+      out.push('<div class="cue' + (pending ? ' partial' : '') + '"><time>' + m[1] + '</time><p>' + inline(pending ? m[2].slice(0, -7) + ' …' : m[2]) + '</p></div>'); i++;
     } else if (/^>/.test(trimmed)) {
       const quote = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) quote.push(lines[i++].replace(/^\s*>\s?/, ''));

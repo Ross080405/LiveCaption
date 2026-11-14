@@ -167,7 +167,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         transcriber.onChange = { [weak self] in
             guard let self else { return }
             self.refreshSubtitle()
-            self.recording.linesChanged(self.transcriber.lines)
+            self.recording.linesChanged(self.transcriber.lines,
+                                        partial: self.transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         transcriber.onStateChange = { [weak self] running in
             if !running, let self { self.recording.flush(lines: self.transcriber.lines) }
