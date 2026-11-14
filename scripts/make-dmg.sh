@@ -41,7 +41,7 @@ fi
 
 rm -f "$DMG"
 hdiutil create -volname "LiveCaption $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-echo "✓ 安装包：$DMG（$(du -h "$DMG" | cut -f1 | tr -d ' ')）"
+echo "✓ 安装包：${DMG}（$(du -h "$DMG" | cut -f1 | tr -d ' ')）"
 
 if [[ "$SIGN_IDENTITY" == Developer\ ID* ]]; then
   codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"

@@ -34,5 +34,5 @@ PASS="$(/usr/bin/openssl rand -hex 16)"   # 只用于这一次导入的临时口
 /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -name "$NAME" -out id.p12 -passout "pass:$PASS"
 security import id.p12 -k "$HOME/Library/Keychains/login.keychain-db" -P "$PASS" -T /usr/bin/codesign
 
-echo "✓ 已创建：$NAME（显示 NOT_TRUSTED 是正常的，不影响本机签名）"
-echo "  删除方法：钥匙串访问 → 登录 → 我的证书 → 删除「$NAME」"
+echo "✓ 已创建：${NAME}（显示 NOT_TRUSTED 是正常的，不影响本机签名）"
+echo "  删除方法：钥匙串访问 → 登录 → 我的证书 → 删除「${NAME}」"

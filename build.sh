@@ -32,10 +32,10 @@ IDENTITY="${SIGN_IDENTITY:-LiveCaption Local Signing}"
 if [[ "$IDENTITY" == Developer\ ID* ]]; then
   # 公证要求：加固运行时（hardened runtime）+ 时间戳；麦克风等能力写在 entitlements 里
   codesign --force --options runtime --timestamp --entitlements scripts/LiveCaption.entitlements --sign "$IDENTITY" "$APP"
-  echo "→ 已用「$IDENTITY」签名（加固运行时）"
+  echo "→ 已用「${IDENTITY}」签名（加固运行时）"
 elif [ "$IDENTITY" != "-" ] && security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; then
   codesign --force --sign "$IDENTITY" "$APP"
-  echo "→ 已用「$IDENTITY」签名"
+  echo "→ 已用「${IDENTITY}」签名"
 else
   codesign --force --sign - "$APP"
   echo "→ 临时签名（ad-hoc）：重新编译后需要重新授权系统权限"
