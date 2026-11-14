@@ -148,6 +148,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         refreshSubtitle()
+
+        Log.startSession()
+        Log.write("日志文件 \(Log.fileURL.path)")
+        // 调试用：open LiveCaption.app --args -autostart YES  启动后立刻开始新记录
+        if defaults.bool(forKey: "autostart") {
+            DispatchQueue.main.async { [weak self] in self?.startNewRecording() }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -196,13 +203,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .paused: name = "pause.circle"
         case .idle: name = "captions.bubble"
         }
-        if let image = NSImage(systemSymbolName: name, accessibilityDescription: "LiveCaption") {
-            image.isTemplate = true
-            button.image = image
+        let metering = transcriber.isRunning
+        if let symbol = NSImage(systemSymbolName: name, accessibilityDescription: "LiveCaption") {
+            button.image = metering
+                ? Self.iconWithMeter(symbol, level: CGFloat(displayedLevel), receiving: transcriber.isReceivingAudio)
+                : { symbol.isTemplate = true; return symbol }()
             button.title = ""
         } else {
             button.title = transcriber.isRunning ? "字幕●" : "字幕"
         }
+        button.toolTip = metering
+            ? (transcriber.isReceivingAudio ? "右侧竖条 = 输入音量。说话时会跳动；跳动但没字幕 = 收到声音但没识别出来"
+                                            : "没有收到任何声音：检查麦克风 / 音频来源和权限")
+            : nil
+
+        // 记录时每 0.1 秒刷新音量条
+        if metering, levelTimer == nil {
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.levelTick() }
+            RunLoop.main.add(timer, forMode: .common)
+            levelTimer = timer
+        } else if !metering, levelTimer != nil {
+            levelTimer?.invalidate()
+            levelTimer = nil
+            displayedLevel = 0
+        }
+    }
+
+    // MARK: - 菜单栏音量条
+
+    private var levelTimer: Timer?
+    private var displayedLevel: Float = 0
+
+    private func levelTick() {
+        // 上升立刻跟上，下降慢慢回落，看起来更稳
+        let level = transcriber.inputLevel
+        displayedLevel = level > displayedLevel ? level : max(level, displayedLevel - 0.08)
+        updateStatusIcon()
+    }
+
+    /// 图标 + 右侧竖直音量条（模板图，自动适应深浅色菜单栏）。
+    /// 条里有填充 = 收到声音；空心框 = 收到的是静音；虚线框 = 完全没有音频数据。
+    private static func iconWithMeter(_ symbol: NSImage, level: CGFloat, receiving: Bool) -> NSImage {
+        let icon = symbol.size
+        let barWidth: CGFloat = 5, gap: CGFloat = 3
+        let height = max(icon.height, 16)
+        let size = NSSize(width: icon.width + gap + barWidth, height: height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            symbol.draw(in: NSRect(x: 0, y: (height - icon.height) / 2, width: icon.width, height: icon.height))
+            let frame = NSRect(x: icon.width + gap + 0.5, y: 1.5, width: barWidth - 1, height: height - 3)
+            let outline = NSBezierPath(roundedRect: frame, xRadius: 1.5, yRadius: 1.5)
+            outline.lineWidth = 1
+            if !receiving { outline.setLineDash([1.5, 1.5], count: 2, phase: 0) }
+            NSColor.black.withAlphaComponent(receiving ? 0.45 : 0.8).setStroke()
+            outline.stroke()
+            if receiving, level > 0.02 {
+                let inner = frame.insetBy(dx: 1, dy: 1)
+                let fill = NSRect(x: inner.minX, y: inner.minY, width: inner.width,
+                                  height: max(1, inner.height * min(1, level)))
+                NSColor.black.setFill()
+                NSBezierPath(rect: fill).fill()
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    /// 菜单里的一行文字说明：区分「没收到声音」和「收到声音但没识别出来」
+    private var audioStatusText: String {
+        guard transcriber.isRunning else { return "" }
+        if !transcriber.isReceivingAudio {
+            return "⚠️ 没有收到音频数据（检查\(source == .microphone ? "麦克风" : "系统录音")权限 / 输入设备）"
+        }
+        let level = transcriber.inputLevel
+        if level < 0.1 { return "输入音量：几乎无声（收到的是静音）" }
+        return "输入音量：\(Int(level * 100))%  收到声音 ✓"
     }
 
     // MARK: - 菜单（每次打开时重建，状态总是最新）
@@ -244,6 +319,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let info = item("正在写入：\(recording.displayName)", nil)
             info.isEnabled = false
             menu.addItem(info)
+            if transcriber.isRunning {
+                let audio = item(audioStatusText, nil)
+                audio.isEnabled = false
+                menu.addItem(audio)
+            }
 
         case .paused:
             let resume = item("▶︎ 继续（接着写入 \(recording.displayName)）", #selector(resumeRecording))
@@ -699,6 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func showError(_ error: TranscriberError) {
+        Log.write("错误弹窗：\(error.message.replacingOccurrences(of: "\n", with: " "))")
         refreshSubtitle()
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()

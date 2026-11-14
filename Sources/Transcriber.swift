@@ -74,6 +74,104 @@ final class Transcriber: NSObject {
     private var systemCapture: SystemAudioCapture?
     private var source: AudioSourceKind = .microphone
 
+    // 诊断：音频统计（音频线程写、主线程读，用 statsLock 保护）
+    private let statsLock = NSLock()
+    private var statChunks = 0
+    private var statRmsSum: Float = 0
+    private var statPeak: Float = 0
+    private var lastRms: Float = 0
+    private var lastBufferTime = Date.distantPast
+    private var statsTimer: Timer?
+    private var loggedBufferFormat = false
+
+    /// 本地识别一直失败时改走在线识别
+    private var forceOnline = false
+    private var onDeviceGotResult = false
+    private var onDeviceFailures = 0
+
+    /// 当前输入音量 0…1（约 -60dB…-10dB），最近 0.4 秒没收到音频则为 0。任何线程可读。
+    var inputLevel: Float {
+        statsLock.lock()
+        let rms = lastRms
+        let age = Date().timeIntervalSince(lastBufferTime)
+        statsLock.unlock()
+        guard age < 0.4, rms > 0 else { return 0 }
+        let db = 20 * log10(rms)
+        return max(0, min(1, (db + 60) / 50))
+    }
+
+    /// 最近 0.4 秒内有没有音频数据送达（哪怕是静音）
+    var isReceivingAudio: Bool {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return Date().timeIntervalSince(lastBufferTime) < 0.4
+    }
+
+    private static func describe(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: return "authorized"
+        case .denied: return "denied"
+        case .restricted: return "restricted"
+        case .notDetermined: return "notDetermined"
+        @unknown default: return "unknown(\(status.rawValue))"
+        }
+    }
+
+    private static func describe(_ status: AVAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: return "authorized"
+        case .denied: return "denied"
+        case .restricted: return "restricted"
+        case .notDetermined: return "notDetermined"
+        @unknown default: return "unknown(\(status.rawValue))"
+        }
+    }
+
+    private func startStatsTimer() {
+        statsLock.lock()
+        statChunks = 0; statRmsSum = 0; statPeak = 0
+        statsLock.unlock()
+        statsTimer?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.logAudioStats() }
+        RunLoop.main.add(timer, forMode: .common)
+        statsTimer = timer
+    }
+
+    private func logAudioStats() {
+        statsLock.lock()
+        let chunks = statChunks
+        let avg = chunks > 0 ? statRmsSum / Float(chunks) : 0
+        let peak = statPeak
+        statChunks = 0; statRmsSum = 0; statPeak = 0
+        statsLock.unlock()
+        if chunks == 0 {
+            Log.write("音频统计(5s)：没有收到任何音频块 ⚠️（来源=\(source.rawValue)）")
+        } else {
+            let db = avg > 0 ? String(format: "%.1f", 20 * log10(avg)) : "-inf"
+            Log.write(String(format: "音频统计(5s)：%d 块，平均音量 rms=%.5f (%@ dB)，峰值 rms=%.5f%@",
+                             chunks, avg, db, peak, peak < 0.0005 ? " ⚠️ 全是静音" : ""))
+        }
+    }
+
+    private static func rms(of buffer: AVAudioPCMBuffer) -> Float {
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return 0 }
+        var sum: Float = 0
+        if let data = buffer.floatChannelData {
+            let p = data[0]
+            for i in 0..<n { sum += p[i] * p[i] }
+        } else if let data = buffer.int16ChannelData {
+            let p = data[0]
+            for i in 0..<n { let v = Float(p[i]) / 32768; sum += v * v }
+        } else if let data = buffer.int32ChannelData {
+            let p = data[0]
+            for i in 0..<n { let v = Float(p[i]) / 2_147_483_648; sum += v * v }
+        } else {
+            return 0
+        }
+        return (sum / Float(n)).squareRoot()
+    }
+
     // MARK: - 开始 / 停止
 
     func start(localeID: String, source: AudioSourceKind,
@@ -85,8 +183,12 @@ final class Transcriber: NSObject {
         self.source = source
         let useWhisper = engine == .whisper && whisper != nil
 
+        Log.write("开始：引擎=\(useWhisper ? "whisper(\(whisper?.model ?? ""), 语言=\(whisper?.language ?? "auto"))" : "apple") 语言=\(localeID) 来源=\(source.rawValue)")
+        Log.write("权限（请求前）：语音识别=\(Self.describe(SFSpeechRecognizer.authorizationStatus())) 麦克风=\(Self.describe(AVCaptureDevice.authorizationStatus(for: .audio)))")
+
         requestPermissions(for: source, needsSpeechRecognition: !useWhisper) { [weak self] error in
             guard let self, token == self.startToken else { return }
+            Log.write("权限（请求后）：语音识别=\(Self.describe(SFSpeechRecognizer.authorizationStatus())) 麦克风=\(Self.describe(AVCaptureDevice.authorizationStatus(for: .audio)))\(error.map { " → 失败：\($0.message)" } ?? "")")
             if let error {
                 self.isStarting = false
                 self.onFatalError?(error)
@@ -115,9 +217,11 @@ final class Transcriber: NSObject {
 
             self.isStarting = false
             guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID)) else {
+                Log.write("SFSpeechRecognizer(locale: \(localeID)) 创建失败：不支持该语言")
                 self.onFatalError?(TranscriberError(message: "系统不支持该识别语言：\(localeID)", settingsAnchor: nil))
                 return
             }
+            Log.write("识别器：locale=\(recognizer.locale.identifier) isAvailable=\(recognizer.isAvailable) supportsOnDeviceRecognition=\(recognizer.supportsOnDeviceRecognition)")
             guard recognizer.isAvailable else {
                 self.onFatalError?(TranscriberError(
                     message: "语音识别暂时不可用。\n请确认已联网，或在「系统设置 → 键盘 → 听写」中开启听写后重试。",
@@ -126,12 +230,14 @@ final class Transcriber: NSObject {
             }
             self.recognitionEngine = .apple
             self.recognizer = recognizer
-            self.isOnDevice = recognizer.supportsOnDeviceRecognition
+            self.isOnDevice = recognizer.supportsOnDeviceRecognition && !self.forceOnline
             self.isRunning = true
             self.consecutiveErrors = 0
+            self.onDeviceFailures = 0
             if self.origin == nil { self.origin = Date() }
             self.startNewSegment()
             self.startAudioOrFail()
+            self.startStatsTimer()
 
             self.tickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 self?.tick()
@@ -156,6 +262,7 @@ final class Transcriber: NSObject {
         }
         streamer.onCommit = { [weak self] text, start, end in
             guard let self else { return }
+            Log.write("定稿[whisper] #\(self.lines.count + 1)：\(text)")
             self.lines.append(CaptionLine(text: text, start: start, end: end))
             self.partial = ""
             self.partialStart = nil
@@ -168,6 +275,7 @@ final class Transcriber: NSObject {
         streamer.start()
 
         startAudioOrFail()
+        startStatsTimer()
         onStateChange?(true)
         onChange?()
     }
@@ -176,6 +284,7 @@ final class Transcriber: NSObject {
         startAudio { [weak self] error in
             guard let self else { return }
             if let error {
+                Log.write("音频启动失败：\(error.message)")
                 self.stop()
                 self.onFatalError?(error)
             }
@@ -197,6 +306,9 @@ final class Transcriber: NSObject {
         isRunning = false
         tickTimer?.invalidate()
         tickTimer = nil
+        statsTimer?.invalidate()
+        statsTimer = nil
+        Log.write("停止：共 \(lines.count) 句")
         stopMic()
         systemCapture?.stop()
         systemCapture = nil
@@ -274,10 +386,16 @@ final class Transcriber: NSObject {
     // MARK: - 音频采集
 
     private func startAudio(completion: @escaping (TranscriberError?) -> Void) {
+        // 调试用：--args -testAudioFile /path/to.wav  用音频文件代替麦克风（按实时速度送入）
+        if let path = UserDefaults.standard.string(forKey: "testAudioFile") {
+            startTestFile(path, completion: completion)
+            return
+        }
         switch source {
         case .microphone:
             let input = engine.inputNode
             let format = input.outputFormat(forBus: 0)
+            Log.write("麦克风：设备=\(AVCaptureDevice.default(for: .audio)?.localizedName ?? "无") 输入格式=\(format.sampleRate)Hz \(format.channelCount)声道 \(format.commonFormat == .pcmFormatFloat32 ? "float32" : "format#\(format.commonFormat.rawValue)") interleaved=\(format.isInterleaved)")
             guard format.sampleRate > 0, format.channelCount > 0 else {
                 completion(TranscriberError(message: "没有找到可用的麦克风。", settingsAnchor: nil))
                 return
@@ -313,6 +431,7 @@ final class Transcriber: NSObject {
             }
             systemCapture = capture
             capture.start { message in
+                Log.write("系统声音采集：\(message ?? "已启动")")
                 DispatchQueue.main.async {
                     completion(message.map { TranscriberError(message: $0, settingsAnchor: "Privacy_ScreenCapture") })
                 }
@@ -320,7 +439,46 @@ final class Transcriber: NSObject {
         }
     }
 
+    private var testFeedToken = 0
+
+    private func startTestFile(_ path: String, completion: @escaping (TranscriberError?) -> Void) {
+        guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)) else {
+            completion(TranscriberError(message: "测试音频打不开：\(path)", settingsAnchor: nil))
+            return
+        }
+        let format = file.processingFormat
+        Log.write("测试音频：\(path) \(format.sampleRate)Hz \(format.channelCount)声道 \(Double(file.length) / format.sampleRate)s")
+        testFeedToken += 1
+        let token = testFeedToken
+        let chunk = AVAudioFrameCount(format.sampleRate / 10)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var next = Date()
+            var ended = false
+            while let self, self.testFeedToken == token {
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk) else { return }
+                if !ended {
+                    try? file.read(into: buffer, frameCount: chunk)
+                    if buffer.frameLength == 0 {
+                        ended = true
+                        Log.write("测试音频：播放完毕，之后送静音")
+                    }
+                }
+                if ended {   // 文件结束后继续送静音，让最后一句能定稿
+                    buffer.frameLength = chunk
+                    for c in 0..<Int(format.channelCount) {
+                        memset(buffer.floatChannelData?[c], 0, Int(chunk) * MemoryLayout<Float>.size)
+                    }
+                }
+                self.append(buffer)
+                next = next.addingTimeInterval(0.1)
+                Thread.sleep(until: next)
+            }
+        }
+        completion(nil)
+    }
+
     private func stopMic() {
+        testFeedToken += 1
         if let observer = configObserver {
             NotificationCenter.default.removeObserver(observer)
             configObserver = nil
@@ -344,6 +502,20 @@ final class Transcriber: NSObject {
 
     /// 在音频线程调用
     private func append(_ buffer: AVAudioPCMBuffer) {
+        let rms = Self.rms(of: buffer)
+        statsLock.lock()
+        statChunks += 1
+        statRmsSum += rms
+        statPeak = max(statPeak, rms)
+        lastRms = rms
+        lastBufferTime = Date()
+        let first = !loggedBufferFormat
+        loggedBufferFormat = true
+        statsLock.unlock()
+        if first {
+            Log.write("收到第一块音频：\(buffer.format.sampleRate)Hz \(buffer.format.channelCount)声道 \(buffer.frameLength) 帧")
+        }
+
         requestLock.lock()
         let request = currentRequest
         let streamer = activeStreamer
@@ -363,9 +535,13 @@ final class Transcriber: NSObject {
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
         request.addsPunctuation = true
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true   // 本地识别：不上传、无时长限制
+        // 本地识别：不上传、无时长限制。本机没有可用的听写模型时（一直报错）改走在线识别。
+        let onDevice = recognizer.supportsOnDeviceRecognition && !forceOnline
+        request.requiresOnDeviceRecognition = onDevice
+        if onDevice != isOnDevice || id == 1 {
+            Log.write("识别段 #\(id)：\(onDevice ? "本地识别" : "在线识别")")
         }
+        isOnDevice = onDevice
 
         requestLock.lock()
         currentRequest = request
@@ -393,6 +569,7 @@ final class Transcriber: NSObject {
 
         let text = partial.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty, let task {
+            Log.write("定稿[apple] #\(lines.count + 1)：\(text)")
             lines.append(CaptionLine(text: text, start: partialStart ?? sessionStart, end: Date()))
             let id = sessionID
             finishing[id] = (lines.count - 1, task)
@@ -443,9 +620,13 @@ final class Transcriber: NSObject {
         // 当前段
         if let result {
             consecutiveErrors = 0
+            if isOnDevice { onDeviceGotResult = true; onDeviceFailures = 0 }
             let text = result.bestTranscription.formattedString
             if text != partial {
-                if partial.isEmpty { partialStart = Date() }
+                if partial.isEmpty {
+                    partialStart = Date()
+                    Log.write(String(format: "段#%d 首个实时结果（开段后 %.1fs）：%@", id, Date().timeIntervalSince(sessionStart), text))
+                }
                 partial = text
                 lastPartialChange = Date()
                 onChange?()
@@ -457,12 +638,27 @@ final class Transcriber: NSObject {
         }
 
         if let error {
-            consecutiveErrors += 1
+            let ns = error as NSError
+            // 1110 = 这一段里没检测到说话（安静时的正常情况），不算故障
+            let noSpeech = ns.domain == "kAFAssistantErrorDomain" && ns.code == 1110
+            Log.write("识别错误 段#\(id) \(isOnDevice ? "本地" : "在线")：domain=\(ns.domain) code=\(ns.code) \(ns.localizedDescription)\(noSpeech ? "（没检测到说话）" : "")")
+            if !noSpeech { consecutiveErrors += 1 }
             finishSegment()
             onChange?()
             guard isRunning else { return }
 
+            // 本地识别从没出过结果又一直报错：多半是本机没下载听写模型，改走在线识别
+            if isOnDevice && !onDeviceGotResult && !noSpeech {
+                onDeviceFailures += 1
+                if onDeviceFailures >= 2 {
+                    Log.write("本地识别连续失败 \(onDeviceFailures) 次且从未出过结果 → 改用在线识别")
+                    forceOnline = true
+                    consecutiveErrors = 0
+                }
+            }
+
             if consecutiveErrors >= 8 {
+                Log.write("连续 \(consecutiveErrors) 次识别错误，停止")
                 stop()
                 onFatalError?(TranscriberError(
                     message: "语音识别反复出错：\(error.localizedDescription)\n\n可尝试：在「系统设置 → 键盘 → 听写」中开启听写；检查网络；或换一种识别语言。",

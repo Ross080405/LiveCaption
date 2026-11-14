@@ -43,12 +43,17 @@ final class WhisperEngine: @unchecked Sendable {
     /// 确保模型可用。completion(nil) 表示就绪，否则是错误描述。
     func prepare(model: String, status: @escaping (String) -> Void, completion: @escaping (String?) -> Void) {
         if loadedModel == model, pipe != nil {
+            Log.write("Whisper：模型 \(model) 已在内存中")
             completion(nil)
             return
         }
         statusHandler = status
         waiters.append(completion)
-        if loadingModel != nil { return }   // 正在加载，等它完成
+        if loadingModel != nil {   // 正在加载，等它完成
+            Log.write("Whisper：模型 \(loadingModel ?? "") 正在加载中，等待")
+            return
+        }
+        let prepareStart = Date()
 
         loadingModel = model
         pipe = nil
@@ -63,16 +68,25 @@ final class WhisperEngine: @unchecked Sendable {
                 try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
                 let folder: URL
                 if let savedPath, Self.looksLikeModelFolder(savedPath) {
+                    Log.write("Whisper 准备：使用已下载的模型 \(savedPath)")
                     folder = URL(fileURLWithPath: savedPath)
                 } else {
+                    Log.write("Whisper 准备：开始下载模型 \(model) → \(base.path)（已保存路径=\(savedPath ?? "无")）")
                     self?.report("正在下载 Whisper 模型…（只需下载一次）")
+                    let lastLogged = ProgressMark()
                     folder = try await WhisperKit.download(variant: model, downloadBase: base, progressCallback: { progress in
                         let percent = Int(progress.fractionCompleted * 100)
+                        if lastLogged.advance(to: percent, step: 10) {
+                            Log.write("Whisper 准备：下载 \(percent)%")
+                        }
                         self?.report("正在下载 Whisper 模型 \(percent)%（只需下载一次）")
                     })
+                    Log.write(String(format: "Whisper 准备：下载完成 %@（%.1fs）", folder.path, Date().timeIntervalSince(prepareStart)))
                     DispatchQueue.main.async { self?.defaults.set(folder.path, forKey: savedKey) }
                 }
 
+                let loadStart = Date()
+                Log.write("Whisper 准备：开始加载模型（prewarm）")
                 self?.report("正在加载 Whisper 模型…第一次会比较久（系统在为你的芯片优化模型）")
                 let config = WhisperKitConfig(downloadBase: base,
                                               modelFolder: folder.path,
@@ -81,12 +95,15 @@ final class WhisperEngine: @unchecked Sendable {
                                               load: true,
                                               download: false)
                 let kit = UncheckedBox(try await WhisperKit(config))
+                Log.write(String(format: "Whisper 准备：模型加载完成（%.1fs）", Date().timeIntervalSince(loadStart)))
                 DispatchQueue.main.async {
                     self?.pipe = kit.value
                     self?.loadedModel = model
                     self?.finishLoading(nil)
                 }
             } catch {
+                let ns = error as NSError
+                Log.write("Whisper 准备失败：domain=\(ns.domain) code=\(ns.code) \(error)")
                 let message = "Whisper 模型准备失败：\(error.localizedDescription)\n第一次使用需要联网下载模型；也可以在「识别引擎」里切回系统识别。"
                 DispatchQueue.main.async { self?.finishLoading(message) }
             }
@@ -114,7 +131,13 @@ final class WhisperEngine: @unchecked Sendable {
 
     /// 转写一段 16kHz 单声道音频。completion 在主线程回调，失败时为 nil。
     func transcribe(_ audio: [Float], settings: WhisperSettings, completion: @escaping (String?) -> Void) {
-        guard let pipe else { completion(nil); return }
+        guard let pipe else {
+            Log.write("Whisper 转写：模型未加载，跳过")
+            completion(nil)
+            return
+        }
+        let seconds = Double(audio.count) / 16_000
+        let began = Date()
         let options = DecodingOptions(
             task: .transcribe,
             language: settings.language,
@@ -125,9 +148,17 @@ final class WhisperEngine: @unchecked Sendable {
             withoutTimestamps: true
         )
         Task {
-            let results = try? await pipe.transcribe(audioArray: audio, decodeOptions: options)
+            var results: [TranscriptionResult]?
+            do {
+                results = try await pipe.transcribe(audioArray: audio, decodeOptions: options)
+            } catch {
+                let ns = error as NSError
+                Log.write("Whisper 转写错误：domain=\(ns.domain) code=\(ns.code) \(error)")
+            }
             let raw = results?.map(\.text).joined(separator: " ")
             let text = raw.map { Self.clean($0, simplified: settings.simplifiedChinese) }
+            Log.write(String(format: "Whisper 转写：音频 %.1fs，耗时 %.2fs，原始=「%@」清理后=「%@」",
+                             seconds, Date().timeIntervalSince(began), raw ?? "<失败>", text ?? "<失败>"))
             DispatchQueue.main.async { completion(text) }
         }
     }
@@ -157,6 +188,19 @@ final class WhisperEngine: @unchecked Sendable {
 private struct UncheckedBox<T>: @unchecked Sendable {
     let value: T
     init(_ value: T) { self.value = value }
+}
+
+/// 下载进度日志的节流（每前进 step% 记一次），线程安全
+private final class ProgressMark: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = -100
+    func advance(to value: Int, step: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard value >= last + step else { return false }
+        last = value
+        return true
+    }
 }
 
 /// 把连续的音频流切成「一句一句」交给 Whisper：
@@ -217,14 +261,15 @@ final class WhisperStreamer {
         var sum: Float = 0
         for s in converted { sum += s * s }
         let rms = converted.isEmpty ? 0 : (sum / Float(converted.count)).squareRoot()
-        if noiseFloor == 0 {
-            noiseFloor = rms
-        } else if rms < noiseFloor {
-            noiseFloor = noiseFloor * 0.9 + rms * 0.1
-        } else {
-            noiseFloor = noiseFloor * 0.998 + rms * 0.002
+        // 噪声底只在「非说话」时缓慢上调，低于时快速下调；
+        // 否则持续说话会把噪声底越抬越高，几秒后说话就被当成静音。
+        if noiseFloor == 0 { noiseFloor = min(rms, 0.002) }
+        let isSpeech = rms > max(0.006, noiseFloor * 3)
+        if rms < noiseFloor {
+            noiseFloor = noiseFloor * 0.7 + rms * 0.3
+        } else if !isSpeech {
+            noiseFloor = noiseFloor * 0.995 + rms * 0.005
         }
-        let isSpeech = rms > max(0.008, noiseFloor * 2.5)
 
         samples.append(contentsOf: converted)
         if isSpeech {
