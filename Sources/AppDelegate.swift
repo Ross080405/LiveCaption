@@ -1059,7 +1059,7 @@ extension AppDelegate {
                   let text = try? String(contentsOf: url, encoding: .utf8) else {
                 return .error(404, "找不到这个记录文件")
             }
-            return .json(["name": url.lastPathComponent, "text": text])
+            return .json(["name": url.lastPathComponent, "text": text, "ts": Self.modifiedTime(url)])
         case ("POST", "/api/action"):
             return dashboardAction(request.json)
         case ("POST", "/api/settings"):
@@ -1239,6 +1239,24 @@ extension AppDelegate {
             } else {
                 revealTranscriptFolder()
             }
+        case "save":
+            // 阅读视图里直接编辑后保存
+            guard let url = recordingURL(named: body["name"] as? String ?? ""), let text = body["text"] as? String else {
+                return .error(404, "找不到这个记录文件")
+            }
+            guard url.lastPathComponent != recording.displayName else {
+                return .error(409, "这份记录还在进行中，新字幕会不断写进去，结束后才能编辑。")
+            }
+            // 打开之后文件在别处被改过（比如别的编辑器、接着写入）：不要覆盖掉
+            if let base = body["ts"] as? Double, abs(Self.modifiedTime(url) - base) > 0.001 {
+                return .error(409, "这份文件在你打开之后被别处改过了。为了不覆盖那些修改，这次没有保存：请先复制你改的内容，返回后重新打开再改。")
+            }
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                return .error(409, "保存失败：\(error.localizedDescription)")
+            }
+            extra["saved"] = Self.modifiedTime(url)
         case "copy":
             // 页面里的「复制全文」：由应用来写剪贴板，窗口里和浏览器里都能用
             guard let url = recordingURL(named: body["name"] as? String ?? ""),
@@ -1266,6 +1284,10 @@ extension AppDelegate {
             return .error(400, "未知的动作：\(action)")
         }
         return .json(dashboardState().merging(extra) { _, new in new })
+    }
+
+    private static func modifiedTime(_ url: URL) -> Double {
+        ((try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast).timeIntervalSince1970
     }
 
     /// 正在进行、但还没说第一句话（文件还没落盘）的那份记录：也允许改名

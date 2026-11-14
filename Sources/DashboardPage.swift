@@ -209,6 +209,9 @@ body.no-time .doc .cue time { display: none; }
 .reader-title { font: 700 30px/1.2 var(--ui); letter-spacing: -0.03em; margin: 6px 0 0 -8px; padding: 2px 8px; cursor: text; border-radius: 12px; overflow-wrap: break-word; }
 .reader-title.editable:hover { background: var(--fill); }
 button.danger:hover { color: var(--rec); }
+.editor { display: block; width: 100%; min-height: 55vh; margin-top: 22px; border: 0; resize: none; overflow: hidden; background: var(--fill); color: var(--ink);
+  border-radius: var(--r-m); padding: 18px 20px; font: 15.5px/1.75 var(--ui); letter-spacing: inherit; tab-size: 2; }
+.editor:focus { outline: none; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
 button.toggle.on { color: var(--ink); background: var(--fill); }
 
 /* 设置：浮在右侧的圆角面板 */
@@ -353,6 +356,9 @@ button.big { font-size: 16px; padding: 12px 26px; }
         <span class="spacer"></span>
         <button class="ghost toggle" id="r-font" title="切换到衬线字体">Aa</button>
         <button class="ghost toggle" id="r-time" title="显示 / 隐藏时间戳">时间</button>
+        <button class="ghost" id="r-edit" title="直接修改这份记录的文字">编辑</button>
+        <button class="ghost" id="r-cancel" hidden>取消</button>
+        <button class="primary" id="r-save" hidden title="保存（⌘S）">保存</button>
         <button class="ghost" id="r-copy">复制全文</button>
         <button class="ghost" id="r-continue">接着写入</button>
         <button class="ghost" id="r-reveal">在访达中显示</button>
@@ -362,6 +368,7 @@ button.big { font-size: 16px; padding: 12px 26px; }
         <div class="reader-meta" id="r-meta"></div>
         <div class="reader-title" id="r-title"></div>
         <div class="doc" id="r-doc"></div>
+        <textarea class="editor" id="r-editor" spellcheck="false" hidden aria-label="编辑记录内容"></textarea>
       </div>
     </main>
   </div>
@@ -547,14 +554,15 @@ function showView() {
   renderList();
   if (S) render(S);
 }
-function goLive() { doc = null; if (location.hash) location.hash = ''; showView(); }
+function goLive() { if (!leaveEditing()) return; doc = null; if (location.hash) location.hash = ''; showView(); }
 async function route() {
   const m = location.hash.match(/^#r\/(.+)$/);
   if (!m) { if (!(doc && doc.local)) { doc = null; showView(); } return; }
   const name = decodeURIComponent(m[1]);
   try {
     const data = await api('/api/recording?name=' + encodeURIComponent(name));
-    doc = { name: data.name, text: data.text };
+    editing = false;
+    doc = { name: data.name, text: data.text, ts: data.ts };
     showView();
     window.scrollTo(0, 0);
   } catch (e) {
@@ -562,7 +570,7 @@ async function route() {
   }
 }
 window.addEventListener('hashchange', route);
-const openRecording = name => { location.hash = 'r/' + encodeURIComponent(name); };
+const openRecording = name => { if (leaveEditing()) location.hash = 'r/' + encodeURIComponent(name); };
 
 // ---------- 主渲染 ----------
 function render(state) {
@@ -847,7 +855,7 @@ async function loadList() {
   if (doc && !doc.local && recs.some(r => r.name === doc.name && r.active)) {
     try {
       const fresh = await api('/api/recording?name=' + encodeURIComponent(doc.name));
-      if (doc && doc.name === fresh.name && doc.text !== fresh.text) { doc.text = fresh.text; renderReader(); }
+      if (doc && doc.name === fresh.name) { doc.ts = fresh.ts; if (doc.text !== fresh.text) { doc.text = fresh.text; renderReader(); } }
     } catch (e) {}
   }
 }
@@ -892,12 +900,63 @@ function renderReader() {
     : rec ? rec.modified + (rec.active ? ' · 正在记录' : '') + ' · ' + doc.text.length.toLocaleString() + ' 字符' : '';
   // 正文第一行如果就是和标题一样的一级标题，不重复显示
   const body = doc.text.replace(/^\s*#\s+(.*)\n/, (m, h) => (h.trim() === stem(doc.name) || h.trim() === '实时字幕记录') ? '' : m);
-  $('r-doc').innerHTML = markdown(body);
-  for (const id of ['r-continue', 'r-reveal', 'r-trash']) $(id).hidden = !!doc.local;
+  if (!editing) $('r-doc').innerHTML = markdown(body);
+  // 编辑时只留「取消 / 保存」；拖进来的文件和正在记录的那份不能编辑（记录中的文件会被新字幕不断重写）
+  const canEdit = !doc.local && !(rec && rec.active);
+  if (editing && !canEdit) editing = false;
+  $('r-doc').hidden = editing;
+  $('r-editor').hidden = !editing;
+  $('r-edit').hidden = editing || !canEdit;
+  $('r-save').hidden = $('r-cancel').hidden = !editing;
+  for (const id of ['r-font', 'r-time', 'r-copy']) $(id).hidden = editing;
+  for (const id of ['r-continue', 'r-reveal', 'r-trash']) $(id).hidden = editing || !!doc.local;
   $('r-trash').disabled = !!(rec && rec.active);
   $('r-font').classList.toggle('on', document.body.classList.contains('serif'));
   $('r-time').classList.toggle('on', !document.body.classList.contains('no-time'));
 }
+// ---------- 编辑 ----------
+let editing = false;
+const isDirty = () => editing && doc && $('r-editor').value !== doc.text;
+/// 要离开编辑状态（返回、打开别的记录）时调用；有没保存的修改就先问一句。返回 false 表示留下
+function leaveEditing() {
+  if (isDirty() && !confirm('放弃没保存的修改？\n刚才改的内容不会写进文件。')) return false;
+  editing = false;
+  return true;
+}
+function growEditor() {
+  const editor = $('r-editor'), y = window.scrollY;
+  editor.style.height = 'auto';
+  editor.style.height = editor.scrollHeight + 2 + 'px';
+  window.scrollTo(0, y);
+}
+function startEditing() {
+  if (!doc || doc.local) return;
+  editing = true;
+  $('r-editor').value = doc.text;
+  renderReader();
+  growEditor();
+  $('r-editor').focus();
+  $('r-editor').setSelectionRange(0, 0);
+}
+async function saveEditing() {
+  if (!editing || !doc) return;
+  const text = $('r-editor').value;
+  if (text === doc.text) { editing = false; renderReader(); return; }
+  if (new Blob([text]).size > 900000) { showBanner('这份记录太大了（超过 900 KB），没法在这里保存。请用「在访达中显示」找到文件后用别的编辑器改。'); return; }
+  const data = await act('save', { name: doc.name, text, ts: doc.ts });
+  if (!data) return;                      // 失败的原因已经显示在上面的提示里，留在编辑状态
+  doc.text = text; doc.ts = data.saved;
+  editing = false;
+  renderReader();
+  toast('已保存');
+}
+$('r-edit').onclick = startEditing;
+$('r-save').onclick = saveEditing;
+$('r-cancel').onclick = () => { if (leaveEditing()) renderReader(); };
+$('r-editor').oninput = growEditor;
+$('r-editor').onkeydown = e => { if (e.key === 'Escape' && !e.isComposing) { e.preventDefault(); $('r-cancel').click(); } };
+window.addEventListener('beforeunload', e => { if (isDirty()) { e.preventDefault(); e.returnValue = ''; } });
+
 /// 把标题变成输入框；回车 / 失焦保存，Esc 取消
 function editTitle(node, name, save) {
   if (node.dataset.editing) return;
@@ -981,6 +1040,7 @@ $('banner-close').onclick = () => {
 };
 
 document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 's' && editing) { e.preventDefault(); saveEditing(); return; }
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
   if (e.key === 'Escape' && !typing) {
     if (!$('sheet').hidden) openSheet(false);
