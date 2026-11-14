@@ -12,7 +12,8 @@ struct WhisperSettings {
 
 /// 负责下载 / 加载 Whisper 模型（整个应用共用一份），并执行一次转写。
 /// 所有对外方法都在主线程调用，回调也回到主线程。
-final class WhisperEngine {
+/// 只在主线程读写状态（后台任务通过 DispatchQueue.main 回到主线程），所以标记为 @unchecked Sendable。
+final class WhisperEngine: @unchecked Sendable {
     static let shared = WhisperEngine()
 
     static let models: [(id: String, name: String)] = [
@@ -79,9 +80,9 @@ final class WhisperEngine {
                                               prewarm: true,
                                               load: true,
                                               download: false)
-                let kit = try await WhisperKit(config)
+                let kit = UncheckedBox(try await WhisperKit(config))
                 DispatchQueue.main.async {
-                    self?.pipe = kit
+                    self?.pipe = kit.value
                     self?.loadedModel = model
                     self?.finishLoading(nil)
                 }
@@ -150,6 +151,12 @@ final class WhisperEngine {
         }
         return t
     }
+}
+
+/// 把非 Sendable 的对象交回主线程用（此后只在主线程访问）
+private struct UncheckedBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
 }
 
 /// 把连续的音频流切成「一句一句」交给 Whisper：
