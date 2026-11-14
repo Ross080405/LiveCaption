@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ScreenCaptureKit
 import Speech
 import UniformTypeIdentifiers
 import Carbon
@@ -1009,6 +1010,31 @@ extension AppDelegate {
         }
     }
 
+    /// 把字幕条窗口连续截成 ~/Library/Logs/LiveCaption-panel-N.png
+    private func snapshotPanel(frames: Int) {
+        let windowID = CGWindowID(panel.windowNumber)
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+            guard let window = content?.windows.first(where: { $0.windowID == windowID }) else {
+                Log.write("调试截图：找不到字幕条窗口 \(error?.localizedDescription ?? "")")
+                return
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let config = SCStreamConfiguration()
+            config.width = Int(window.frame.width * 2)
+            config.height = Int(window.frame.height * 2)
+            config.showsCursor = false
+            for i in 0..<min(frames, 12) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.12) {
+                    SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
+                        guard let image else { Log.write("调试截图失败：\(error?.localizedDescription ?? "")"); return }
+                        let url = Log.fileURL.deletingLastPathComponent().appendingPathComponent("LiveCaption-panel-\(i).png")
+                        try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: url)
+                    }
+                }
+            }
+        }
+    }
+
     @objc private func openDashboard() {
         guard let url = dashboard.url else {
             showError(TranscriberError(message: "控制台没有启动成功（本机端口被占用）。详见 \(Log.fileURL.path)", settingsAnchor: nil))
@@ -1220,6 +1246,10 @@ extension AppDelegate {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(text, forType: .string)
         case "preloadWhisper": preloadWhisper()
+        case "debugSnapshot":
+            // 调试用（启动参数 -debugSnapshot YES 才生效）：连续截几张字幕条窗口，用来检查动画
+            guard defaults.bool(forKey: "debugSnapshot") else { return .error(400, "未知的动作：\(action)") }
+            snapshotPanel(frames: body["frames"] as? Int ?? 6)
         case "requestPermission": requestPermission(body["kind"] as? String ?? "")
         case "finishOnboarding": onboarded = true
         case "showOnboarding": onboarded = false

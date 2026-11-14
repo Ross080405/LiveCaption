@@ -55,6 +55,16 @@ final class SubtitleView: NSView {
 
     private let prevLabel = NSTextField(labelWithString: "")
     private let mainLabel = NSTextField(labelWithString: "")
+    /// 影子层：和主字幕同样的文字、稍微偏下并模糊，只显示刚出现的词。
+    /// 新词先在这一层以影子出现，再在主字幕上凝成清晰的字。
+    private let ghostLabel = NSTextField(labelWithString: "")
+    private var births: [CFTimeInterval] = []        // mainText 里每个字符出现的时刻
+    private var shownChars: [Character] = []         // 实际显示的文字（太长时是「…」加结尾部分）
+    private var shownOffset = 0                      // shownChars 对应 mainText 的起始位置
+    private var shownTruncated = false
+    private var animationTimer: Timer?
+    private static let appearDuration: CFTimeInterval = 0.95
+    private static let ghostColor = NSColor(srgbRed: 1.0, green: 0.52, blue: 0.2, alpha: 1)
     private var prevText = ""
     private var mainText = ""
     private let padding: CGFloat = 20
@@ -79,7 +89,7 @@ final class SubtitleView: NSView {
         shadow.shadowBlurRadius = 3
         shadow.shadowOffset = NSSize(width: 0, height: -1)
 
-        for label in [prevLabel, mainLabel] {
+        for label in [prevLabel, ghostLabel, mainLabel] {
             label.alignment = .center
             label.lineBreakMode = .byWordWrapping
             label.maximumNumberOfLines = 0
@@ -91,6 +101,13 @@ final class SubtitleView: NSView {
             addSubview(label)
         }
         mainLabel.textColor = .white
+        ghostLabel.shadow = nil
+        ghostLabel.wantsLayer = true
+        ghostLabel.layerUsesCoreImageFilters = true
+        if let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 3]) {
+            ghostLabel.contentFilters = [blur]
+        }
+        ghostLabel.isHidden = true
         prevLabel.textColor = NSColor.white.withAlphaComponent(0.6)
     }
 
@@ -98,6 +115,20 @@ final class SubtitleView: NSView {
 
     func set(previous: String, current: String) {
         guard previous != prevText || current != mainText else { return }
+        // 和上一次相同的开头保持不动，后面新出现（或被改写）的字符记下出现时刻，按词依次显形
+        let old = Array(mainText), new = Array(current)
+        var same = 0
+        while same < min(old.count, new.count), same < births.count, old[same] == new[same] { same += 1 }
+        let now = CACurrentMediaTime()
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        var updated = Array(births.prefix(same))
+        var delay: CFTimeInterval = 0
+        for ch in new[same...] {
+            updated.append(reduceMotion ? 0 : now + delay)
+            if ch.isWhitespace { delay = min(delay + 0.045, 0.45) }
+            else if ch.unicodeScalars.first.map({ $0.value >= 0x2E80 }) == true { delay = min(delay + 0.03, 0.45) }   // 中日韩文字按字
+        }
+        births = updated
         prevText = previous
         mainText = current
         needsLayout = true
@@ -126,14 +157,82 @@ final class SubtitleView: NSView {
         let mainString = Self.fittingTail(mainText, font: mainFont, width: measureWidth, maxLines: mainLines)
         let prevString = Self.fittingTail(prevText, font: prevFont, width: measureWidth, maxLines: 1)
 
-        mainLabel.font = mainFont
         prevLabel.font = prevFont
-        mainLabel.stringValue = mainString
         prevLabel.stringValue = prevString
+        shownChars = Array(mainString)
+        shownTruncated = mainString != mainText
+        shownOffset = shownTruncated ? mainText.count - (shownChars.count - 1) : 0
 
         let mainHeight = Self.textHeight(mainString, font: mainFont, width: measureWidth) + 4
         mainLabel.frame = NSRect(x: padding, y: padding, width: width, height: mainHeight)
         prevLabel.frame = NSRect(x: padding, y: padding + mainHeight + gap, width: width, height: prevLineH + 4)
+        ghostLabel.frame = mainLabel.frame.offsetBy(dx: 0, dy: -max(4, fontSize * 0.3))
+
+        if applyAppearance() { startAnimation() }
+    }
+
+    // MARK: - 新词显形动画
+
+    /// 按每个字符出现了多久，设置主字幕和影子层的透明度。返回是否还有字符在显形中。
+    @discardableResult
+    private func applyAppearance() -> Bool {
+        let now = CACurrentMediaTime()
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byWordWrapping
+        let main = NSMutableAttributedString(), ghost = NSMutableAttributedString()
+        var animating = false
+        var run = "", runStep = -1
+
+        func flush() {
+            guard !run.isEmpty else { return }
+            let p = Double(runStep) / 20
+            // 前 40%：只有影子，很快变浓；之后影子慢慢淡去，字渐渐清晰
+            let mainAlpha = p < 0.4 ? 0 : pow((p - 0.4) / 0.6, 1.2)
+            let ghostAlpha = p >= 1 ? 0 : (p < 0.15 ? p / 0.15 : pow(1 - (p - 0.15) / 0.85, 0.7))
+            main.append(NSAttributedString(string: run, attributes: [
+                .font: mainFont, .paragraphStyle: paragraph,
+                .foregroundColor: NSColor.white.withAlphaComponent(mainAlpha)]))
+            let glow = NSShadow()
+            glow.shadowColor = Self.ghostColor.withAlphaComponent(ghostAlpha)
+            glow.shadowBlurRadius = 20
+            glow.shadowOffset = NSSize(width: 0, height: -2)
+            ghost.append(NSAttributedString(string: run, attributes: [
+                .font: mainFont, .paragraphStyle: paragraph, .shadow: glow,
+                .foregroundColor: Self.ghostColor.withAlphaComponent(ghostAlpha)]))
+            run = ""
+        }
+
+        for (k, ch) in shownChars.enumerated() {
+            let index = shownTruncated ? (k == 0 ? -1 : shownOffset + k - 1) : k    // 开头的「…」不参与动画
+            var p = 1.0
+            if index >= 0, index < births.count {
+                p = min(1, max(0, (now - births[index]) / Self.appearDuration))
+            }
+            if p < 1 { animating = true }
+            let step = Int(p * 20)
+            if step != runStep { flush(); runStep = step }
+            run.append(ch)
+        }
+        flush()
+
+        mainLabel.attributedStringValue = main
+        ghostLabel.attributedStringValue = ghost
+        ghostLabel.isHidden = !animating
+        return animating
+    }
+
+    private func startAnimation() {
+        guard animationTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            guard let self, self.applyAppearance() else {
+                timer.invalidate()
+                self?.animationTimer = nil
+                return
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
     }
 
     // MARK: - 文本测量
