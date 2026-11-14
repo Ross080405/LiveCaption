@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 最近一次错误（给控制台显示）
     private var lastError: (id: Int, message: String)?
     private var whisperPreloadStatus: String?
+    private var launchedByURL = false
     private var hotKey: HotKey?
     private var recordHotKey: HotKey?
 
@@ -81,6 +82,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { defaults.bool(forKey: "whisperAutoLanguage") }
         set { defaults.set(newValue, forKey: "whisperAutoLanguage") }
     }
+
+    /// 新记录怎么起名："pattern" 按命名规则自动起名；"ask" 开始前先问名字
+    private var namingMode: String {
+        get { defaults.string(forKey: "namingMode") == "ask" ? "ask" : "pattern" }
+        set { defaults.set(newValue == "ask" ? "ask" : "pattern", forKey: "namingMode") }
+    }
+    private var namePattern: String {
+        get {
+            let saved = (defaults.string(forKey: "namePattern") ?? "").trimmingCharacters(in: .whitespaces)
+            return saved.isEmpty ? RecordingFile.defaultPattern : saved
+        }
+        set { defaults.set(newValue, forKey: "namePattern") }
+    }
+    private var nameContext: RecordingFile.NameContext {
+        RecordingFile.NameContext(source: source == .microphone ? "麦克风" : "系统声音",
+                                  language: languages.first { $0.id == localeID }?.name ?? localeID)
+    }
+
+    /// 本次记录已经录了多久（不算暂停的时间）
+    private var activeSince: Date?
+    private var accumulatedSeconds: TimeInterval = 0
+    private var elapsedSeconds: TimeInterval {
+        accumulatedSeconds + (recordState == .recording ? activeSince.map { Date().timeIntervalSince($0) } ?? 0 : 0)
+    }
+    private func stopClock() {
+        if let since = activeSince { accumulatedSeconds += Date().timeIntervalSince(since) }
+        activeSince = nil
+    }
+    /// 记录列表里每个文件的第一句话（按修改时间缓存）
+    private var snippetCache: [String: (modified: Date, text: String)] = [:]
 
     private var whisperSettings: WhisperSettings {
         let code: String
@@ -156,11 +187,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.startSession()
         Log.write("日志文件 \(Log.fileURL.path)")
         startDashboard()
-        if dashboardOnLaunch && !defaults.bool(forKey: "autostart") { openDashboard() }
+        // 稍等一下再决定要不要打开控制台：如果是控制台页面上的「打开 LiveCaption」把应用叫起来的，
+        // 那个页面会自己恢复，不用再开一个标签页
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.dashboardOnLaunch, !self.launchedByURL,
+                  !self.defaults.bool(forKey: "autostart") else { return }
+            self.openDashboard()
+        }
         // 调试用：open LiveCaption.app --args -autostart YES  启动后立刻开始新记录
         if defaults.bool(forKey: "autostart") {
-            DispatchQueue.main.async { [weak self] in self?.startNewRecording() }
+            DispatchQueue.main.async { [weak self] in self?.beginNewRecording(title: nil) }
         }
+    }
+
+    /// livecaption://open —— 控制台页面在应用没运行时用它把应用叫起来；启动本身就是全部要做的事
+    func application(_ application: NSApplication, open urls: [URL]) {
+        launchedByURL = true
+        Log.write("通过链接打开：\(urls.map(\.absoluteString).joined(separator: " "))")
     }
 
     /// 应用已在运行时再次打开它（访达 / 启动台里双击）：打开控制台
@@ -195,7 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                      current: source == .microphone ? "正在聆听…请开始说话" : "正在收听系统声音…")
         } else {
             view.set(previous: "LiveCaption 实时字幕",
-                     current: "右键这里或点菜单栏图标 → 开始新记录（⌥⌘P）")
+                     current: "按 ⌥⌘P 开始记录")
         }
         if let toast = activeToast, partial.isEmpty {
             view.set(previous: "LiveCaption", current: toast)
@@ -443,37 +486,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(submenu("识别引擎" + (recognitionEngine == .whisper ? "（Whisper）" : ""), engineMenu))
         menu.addItem(.separator())
 
-        // 外观
-        let fontMenu = NSMenu()
-        for f in fontSizes {
-            let it = item(f.name, #selector(selectFontSize(_:)))
-            it.representedObject = Double(f.size)
-            it.state = f.size == fontSize ? .on : .off
-            fontMenu.addItem(it)
-        }
-        menu.addItem(submenu("字号", fontMenu))
-
-        let bgMenu = NSMenu()
-        for o in opacities {
-            let it = item(o.name, #selector(selectOpacity(_:)))
-            it.representedObject = Double(o.value)
-            it.state = o.value == opacity ? .on : .off
-            bgMenu.addItem(it)
-        }
-        menu.addItem(submenu("背景", bgMenu))
-
+        // 字幕条：显示 / 锁定常用，放在外面；外观收进子菜单
+        menu.addItem(item(panel.isVisible ? "隐藏字幕条" : "显示字幕条", #selector(toggleWindow)))
         let lock = item("锁定字幕条（鼠标可穿透）", #selector(toggleClickThrough))
         lock.state = clickThrough ? .on : .off
         menu.addItem(lock)
-        menu.addItem(item(panel.isVisible ? "隐藏字幕条" : "显示字幕条", #selector(toggleWindow)))
-        menu.addItem(item("字幕条回到默认位置", #selector(resetPosition)))
+
+        let lookMenu = NSMenu()
+        let fontHeader = item("字号", nil)
+        fontHeader.isEnabled = false
+        lookMenu.addItem(fontHeader)
+        for f in fontSizes {
+            let it = item("    " + f.name, #selector(selectFontSize(_:)))
+            it.representedObject = Double(f.size)
+            it.state = f.size == fontSize ? .on : .off
+            lookMenu.addItem(it)
+        }
+        lookMenu.addItem(.separator())
+        let bgHeader = item("背景", nil)
+        bgHeader.isEnabled = false
+        lookMenu.addItem(bgHeader)
+        for o in opacities {
+            let it = item("    " + o.name, #selector(selectOpacity(_:)))
+            it.representedObject = Double(o.value)
+            it.state = o.value == opacity ? .on : .off
+            lookMenu.addItem(it)
+        }
+        lookMenu.addItem(.separator())
+        lookMenu.addItem(item("回到默认位置", #selector(resetPosition)))
+        menu.addItem(submenu("字幕条外观", lookMenu))
         menu.addItem(.separator())
 
-        // 记录
+        // 复制与导出
         let hasLines = !transcriber.lines.isEmpty
-        let count = item("已记录 \(transcriber.lines.count) 句", nil)
-        count.isEnabled = false
-        menu.addItem(count)
+        let exportMenu = NSMenu()
+        exportMenu.autoenablesItems = false
         for (title, action) in [("复制全部文字", #selector(copyAll)),
                                 ("保存为文本（.txt）…", #selector(saveText)),
                                 ("导出字幕文件（.srt）…", #selector(saveSRT)),
@@ -481,8 +528,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let it = item(title, action)
             // 记录进行中不能清空（文件内容以这些字幕为准）
             it.isEnabled = hasLines && (action != #selector(clearAll) || recordState == .idle)
-            menu.addItem(it)
+            exportMenu.addItem(it)
         }
+        menu.addItem(submenu("复制与导出（已记录 \(transcriber.lines.count) 句）", exportMenu))
         menu.addItem(.separator())
         menu.addItem(item("退出 LiveCaption", #selector(quit)))
     }
@@ -613,12 +661,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 菜单 / 快捷键：按「命名方式」决定要不要先问名字
     @objc private func startNewRecording() {
         guard recordState == .idle else { return }
-        recording.beginNew()
+        if namingMode == "ask" {
+            guard let title = askForTitle() else { return }
+            beginNewRecording(title: title)
+        } else {
+            beginNewRecording(title: nil)
+        }
+    }
+
+    /// title 为空就按命名规则自动起名
+    private func beginNewRecording(title: String?) {
+        guard recordState == .idle else { return }
+        recording.beginNew(title: title, pattern: namePattern, context: nameContext)
         transcriber.clear()
+        accumulatedSeconds = 0
+        activeSince = Date()
         startTranscriber()
         showToast("开始新记录：\(recording.displayName)")
+    }
+
+    /// 弹一个小输入框问名字；取消返回 nil，留空返回空字符串（= 自动起名）
+    private func askForTitle() -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "给这次记录起个名字"
+        alert.informativeText = "留空就按命名规则自动起名，之后也可以随时改。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = RecordingFile.expand(namePattern, date: Date(), context: nameContext)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "开始记录")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     @objc private func continueRecentFile(_ sender: NSMenuItem) {
@@ -648,12 +725,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         transcriber.clear()
+        accumulatedSeconds = 0
+        activeSince = Date()
         startTranscriber()
         showToast("接着写入：\(recording.displayName)")
     }
 
     @objc private func pauseRecording() {
         guard recordState == .recording else { return }
+        stopClock()
         transcriber.stop { [weak self] in
             guard let self else { return }
             self.recording.flush(lines: self.transcriber.lines)
@@ -665,11 +745,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func resumeRecording() {
         guard recordState == .paused, !transcriber.isFinishing else { return }
         recording.markResume(atLine: transcriber.lines.count)
+        activeSince = Date()
         startTranscriber()
     }
 
     @objc private func endRecording() {
         guard recordState != .idle else { return }
+        stopClock()
         // 等最后一句识别完再定稿文件
         transcriber.stop { [weak self] in
             guard let self else { return }
@@ -798,6 +880,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 退出并重新打开自己（权限变更后需要）
+    private func relaunch() {
+        Log.write("重新打开应用")
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundlePath]
+        try? task.run()
+        NSApp.terminate(nil)
+    }
+
     private func showError(_ error: TranscriberError) {
         Log.write("错误弹窗：\(error.message.replacingOccurrences(of: "\n", with: " "))")
         lastError = ((lastError?.id ?? 0) + 1, error.message)
@@ -810,12 +902,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if error.settingsAnchor != nil {
             alert.addButton(withTitle: "打开系统设置")
             alert.addButton(withTitle: "取消")
+            // 屏幕录制权限要重启应用才生效
+            if error.settingsAnchor == "Privacy_ScreenCapture" { alert.addButton(withTitle: "重新打开 LiveCaption") }
         } else {
             alert.addButton(withTitle: "好")
         }
-        if alert.runModal() == .alertFirstButtonReturn, let anchor = error.settingsAnchor,
+        let choice = alert.runModal()
+        if choice == .alertFirstButtonReturn, let anchor = error.settingsAnchor,
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
             NSWorkspace.shared.open(url)
+        } else if choice == .alertThirdButtonReturn {
+            relaunch()
         }
     }
 }
@@ -827,6 +924,21 @@ extension AppDelegate {
         get { defaults.object(forKey: "dashboardOnLaunch") == nil ? true : defaults.bool(forKey: "dashboardOnLaunch") }
         set { defaults.set(newValue, forKey: "dashboardOnLaunch") }
     }
+
+    /// 应用图标的 PNG（控制台页面的标签页图标和标题旁的小图标）
+    private static let iconPNG: Data? = {
+        guard let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+              let image = NSImage(contentsOf: url) else { return nil }
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 128, pixelsHigh: 128, bitsPerSample: 8,
+                                   samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        guard let rep, let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: 128, height: 128))
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }()
 
     private func startDashboard() {
         dashboard.handler = { [weak self] request in
@@ -847,6 +959,9 @@ extension AppDelegate {
         switch (request.method, request.path) {
         case ("GET", "/"), ("GET", "/index.html"):
             return .text(DashboardPage.html, type: "text/html; charset=utf-8")
+        case ("GET", "/icon.png"):
+            guard let png = Self.iconPNG else { return .error(404, "not found") }
+            return HTTPResponse(contentType: "image/png", body: png)
         case ("GET", "/api/state"):
             return .json(dashboardState())
         case ("GET", "/api/recordings"):
@@ -891,6 +1006,14 @@ extension AppDelegate {
             "onDevice": transcriber.isOnDevice,
             "activeEngine": transcriber.recognitionEngine.rawValue,
             "currentFile": recording.displayName,
+            "elapsed": Int(elapsedSeconds),
+            "naming": [
+                "mode": namingMode,
+                "pattern": namePattern,
+                "defaultPattern": RecordingFile.defaultPattern,
+                "preview": RecordingFile.expand(namePattern, date: Date(), context: nameContext) + ".md",
+                "tokens": RecordingFile.patternTokens.map { ["token": $0.token, "note": $0.note] },
+            ] as [String: Any],
             "lineCount": lines.count,
             "lines": lines.suffix(200).map { ["time": RecordingFile.timeFormatter.string(from: $0.start), "text": $0.text] },
             "partial": transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -955,8 +1078,30 @@ extension AppDelegate {
             .prefix(300)
             .map { ["name": $0.0.lastPathComponent,
                     "modified": RecordingFile.fullFormatter.string(from: $0.1),
+                    "ts": Int($0.1.timeIntervalSince1970),
                     "size": $0.2,
+                    "snippet": snippet(of: $0.0, modified: $0.1),
                     "active": $0.0.lastPathComponent == recording.displayName] }
+    }
+
+    /// 记录里的第一句话，给列表当摘要
+    private func snippet(of url: URL, modified: Date) -> String {
+        if let cached = snippetCache[url.path], cached.modified == modified { return cached.text }
+        var text = ""
+        if let handle = try? FileHandle(forReadingFrom: url) {
+            let head = String(decoding: (try? handle.read(upToCount: 4096)) ?? Data(), as: UTF8.self)
+            try? handle.close()
+            let lines = head.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+            if let cue = lines.first(where: { $0.range(of: #"^\[\d{1,2}:\d{2}(:\d{2})?\]\s*\S"#, options: .regularExpression) != nil }),
+               let close = cue.firstIndex(of: "]") {
+                text = String(cue[cue.index(after: close)...]).trimmingCharacters(in: .whitespaces)
+            } else {
+                text = lines.first { !$0.isEmpty && !$0.hasPrefix("#") && !$0.hasPrefix("开始时间") && !$0.hasPrefix("（") } ?? ""
+            }
+        }
+        text = String(text.prefix(120))
+        snippetCache[url.path] = (modified, text)
+        return text
     }
 
     /// 只允许访问记录文件夹里的 .md / .txt（文件名不能带路径）
@@ -972,8 +1117,26 @@ extension AppDelegate {
     private func dashboardAction(_ body: [String: Any]) -> HTTPResponse {
         let action = body["action"] as? String ?? ""
         Log.write("控制台动作：\(action)")
+        var extra: [String: Any] = [:]
         switch action {
-        case "start": startNewRecording()
+        case "start": beginNewRecording(title: body["title"] as? String)   // 名字在页面上已经问过了
+        case "rename":
+            guard let url = recordingURL(named: body["name"] as? String ?? "") ?? currentUnwrittenFile(named: body["name"] as? String) else {
+                return .error(404, "找不到这个记录文件")
+            }
+            do {
+                extra["renamed"] = try recording.rename(url, to: body["to"] as? String ?? "").lastPathComponent
+            } catch {
+                return .error(409, error.localizedDescription)
+            }
+        case "trash":
+            guard let url = recordingURL(named: body["name"] as? String ?? "") else { return .error(404, "找不到这个记录文件") }
+            guard url.lastPathComponent != recording.displayName else { return .error(409, "这份记录还在进行中，请先结束。") }
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            } catch {
+                return .error(409, "没能移到废纸篓：\(error.localizedDescription)")
+            }
         case "pause": pauseRecording()
         case "resume": resumeRecording()
         case "end": endRecording()
@@ -998,7 +1161,13 @@ extension AppDelegate {
         default:
             return .error(400, "未知的动作：\(action)")
         }
-        return .json(dashboardState())
+        return .json(dashboardState().merging(extra) { _, new in new })
+    }
+
+    /// 正在进行、但还没说第一句话（文件还没落盘）的那份记录：也允许改名
+    private func currentUnwrittenFile(named name: String?) -> URL? {
+        guard let url = recording.url, url.lastPathComponent == name else { return nil }
+        return url
     }
 
     private func dashboardApplySettings(_ body: [String: Any]) -> HTTPResponse {
@@ -1040,6 +1209,8 @@ extension AppDelegate {
             if visible { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
         }
         if let open = body["dashboardOnLaunch"] as? Bool { dashboardOnLaunch = open }
+        if let mode = body["namingMode"] as? String { namingMode = mode }
+        if let pattern = body["namePattern"] as? String { namePattern = String(pattern.prefix(120)) }
         refreshSubtitle()
         return .json(dashboardState())
     }

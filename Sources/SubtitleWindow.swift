@@ -57,7 +57,7 @@ final class SubtitleView: NSView {
     private let mainLabel = NSTextField(labelWithString: "")
     private var prevText = ""
     private var mainText = ""
-    private let padding: CGFloat = 16
+    private let padding: CGFloat = 20
     private let gap: CGFloat = 4
     private static let layoutManager = NSLayoutManager()
 
@@ -69,7 +69,8 @@ final class SubtitleView: NSView {
     init() {
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.cornerRadius = 14
+        layer?.cornerRadius = 24
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
         updateBackground()
 

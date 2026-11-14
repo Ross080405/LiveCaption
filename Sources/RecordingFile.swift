@@ -28,20 +28,97 @@ final class RecordingFile {
 
     // MARK: - 开始 / 继续 / 结束
 
-    func beginNew() {
-        let now = Date()
-        let stamp = DateFormatter()
-        stamp.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        var target = folder.appendingPathComponent("字幕_\(stamp.string(from: now)).md")
+    // MARK: - 命名
+
+    /// 命名规则里可以引用的当前情况
+    struct NameContext {
+        var source = ""
+        var language = ""
+    }
+
+    static let defaultPattern = "字幕_{date}_{time}"
+
+    /// 命名规则里可用的占位符（给控制台显示）
+    static let patternTokens: [(token: String, note: String)] = [
+        ("{date}", "日期 2026-11-14"), ("{time}", "时间 12-21-33"),
+        ("{year}", "年"), ("{month}", "月"), ("{day}", "日"),
+        ("{hour}", "时"), ("{minute}", "分"), ("{weekday}", "星期几"),
+        ("{source}", "音频来源"), ("{language}", "识别语言"),
+    ]
+
+    /// 把用户输入的名字变成安全的文件名（不含扩展名）；可能返回空字符串
+    static func sanitize(_ raw: String) -> String {
+        var name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for ext in [".md", ".txt"] where name.lowercased().hasSuffix(ext) {
+            name = String(name.dropLast(ext.count))
+        }
+        name = name.components(separatedBy: CharacterSet(charactersIn: "/\\:\n\r\t")).joined(separator: "-")
+        while name.hasPrefix(".") { name.removeFirst() }
+        return String(name.prefix(80)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// 按命名规则生成文件名（不含扩展名）
+    static func expand(_ pattern: String, date: Date, context: NameContext) -> String {
+        let numeric = DateFormatter()
+        numeric.locale = Locale(identifier: "en_US_POSIX")
+        let weekday = DateFormatter()
+        weekday.locale = Locale(identifier: "zh_CN")
+        weekday.dateFormat = "EEEE"
+        func part(_ format: String) -> String { numeric.dateFormat = format; return numeric.string(from: date) }
+        let values = [
+            "{date}": part("yyyy-MM-dd"), "{time}": part("HH-mm-ss"),
+            "{year}": part("yyyy"), "{month}": part("MM"), "{day}": part("dd"),
+            "{hour}": part("HH"), "{minute}": part("mm"), "{weekday}": weekday.string(from: date),
+            "{source}": context.source, "{language}": context.language,
+        ]
+        var out = pattern
+        for (token, value) in values { out = out.replacingOccurrences(of: token, with: value) }
+        let name = sanitize(out)
+        return name.isEmpty && pattern != defaultPattern ? expand(defaultPattern, date: date, context: context) : name
+    }
+
+    /// 文件夹里不重名的文件地址：重名时加「 (2)」「 (3)」…
+    private func uniqueURL(_ base: String, ext: String = "md") -> URL {
+        var target = folder.appendingPathComponent("\(base).\(ext)")
         var n = 2
-        while FileManager.default.fileExists(atPath: target.path) {
-            target = folder.appendingPathComponent("字幕_\(stamp.string(from: now)) (\(n)).md")
+        while FileManager.default.fileExists(atPath: target.path) || target.lastPathComponent == latestFile.lastPathComponent {
+            target = folder.appendingPathComponent("\(base) (\(n)).\(ext)")
             n += 1
         }
-        url = target
+        return target
+    }
+
+    /// title 为空时按命名规则自动起名
+    func beginNew(title: String? = nil, pattern: String = RecordingFile.defaultPattern, context: NameContext = NameContext()) {
+        let now = Date()
+        let given = Self.sanitize(title ?? "")
+        url = uniqueURL(given.isEmpty ? Self.expand(pattern, date: now, context: context) : given)
         isContinuingExisting = false
-        prefix = "# 实时字幕记录\n\n开始时间：\(Self.fullFormatter.string(from: now))\n（语音识别结果，可能有同音错字）\n\n"
+        prefix = "# \(given.isEmpty ? "实时字幕记录" : given)\n\n开始时间：\(Self.fullFormatter.string(from: now))\n（语音识别结果，可能有同音错字）\n\n"
         resetState()
+    }
+
+    /// 给记录文件改名（正在记录的那个也可以改，之后的字幕写进新名字）。返回新地址。
+    @discardableResult
+    func rename(_ file: URL, to rawTitle: String) throws -> URL {
+        func fail(_ message: String) -> NSError {
+            NSError(domain: "LiveCaption", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        let base = Self.sanitize(rawTitle)
+        guard !base.isEmpty else { throw fail("名字不能为空。") }
+        let ext = file.pathExtension.isEmpty ? "md" : file.pathExtension
+        let target = folder.appendingPathComponent("\(base).\(ext)")
+        if target.lastPathComponent == file.lastPathComponent { return file }
+        let onlyCaseDiffers = target.lastPathComponent.lowercased() == file.lastPathComponent.lowercased()
+        guard target.lastPathComponent != latestFile.lastPathComponent,
+              onlyCaseDiffers || !FileManager.default.fileExists(atPath: target.path) else {
+            throw fail("已经有一份叫「\(base)」的记录了。")
+        }
+        if FileManager.default.fileExists(atPath: file.path) {
+            try FileManager.default.moveItem(at: file, to: target)
+        }
+        if url?.lastPathComponent == file.lastPathComponent { url = target }
+        return target
     }
 
     func beginContinuing(_ file: URL) throws {

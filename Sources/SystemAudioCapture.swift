@@ -16,12 +16,29 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// completion 返回 nil 表示成功，否则为错误描述（在后台线程回调）
     func start(completion: @escaping (String?) -> Void) {
+        let granted = CGPreflightScreenCaptureAccess()
+        Log.write("屏幕与系统录音权限：\(granted ? "已授权" : "未授权")（应用路径 \(Bundle.main.bundlePath)）")
         let permissionHint = "\n\n请在「系统设置 → 隐私与安全性 → 屏幕与系统录音」中允许 LiveCaption，然后退出并重新打开本应用。"
+        /// 采集失败时给用户看的说明：没有权限时给出具体步骤，而不是系统的英文报错
+        func explain(_ prefix: String, _ error: Error) -> String {
+            Log.write("\(prefix)：\(error)")
+            guard !CGPreflightScreenCaptureAccess() else {
+                return "\(prefix)：\(error.localizedDescription)" + permissionHint
+            }
+            CGRequestScreenCaptureAccess()   // 让 LiveCaption 出现在系统设置的列表里（第一次会弹系统提示）
+            return """
+            这一份 LiveCaption 还没有「屏幕与系统录音」权限，所以采集不到系统声音。
+
+            1. 点「打开系统设置」，在「屏幕与系统录音」里打开 LiveCaption 的开关。
+            2. 如果开关已经是开的：那是旧版本留下的授权（应用重新编译或换了位置后，系统会把它当成另一个应用）。选中 LiveCaption 点「−」删掉，再点「+」重新添加现在这一份：\(Bundle.main.bundlePath)
+            3. 点「重新打开 LiveCaption」（授权要重启应用才生效）。
+            """
+        }
 
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
             guard let self else { return }
             if let error {
-                completion("无法采集系统声音：\(error.localizedDescription)" + permissionHint)
+                completion(explain("无法采集系统声音", error))
                 return
             }
             guard let display = content?.displays.first else {
@@ -53,7 +70,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             self.stream = stream
             stream.startCapture { error in
                 if let error {
-                    completion("无法开始采集系统声音：\(error.localizedDescription)" + permissionHint)
+                    completion(explain("无法开始采集系统声音", error))
                 } else {
                     completion(nil)
                 }
