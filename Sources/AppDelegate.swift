@@ -238,7 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if !partial.isEmpty {
-            view.set(previous: lines.last?.text ?? "", current: partial)
+            view.set(previous: lines.last?.text ?? "", current: partial, settled: false)
         } else if let last = lines.last {
             view.set(previous: lines.count >= 2 ? lines[lines.count - 2].text : "", current: last.text)
         } else if transcriber.isRunning {

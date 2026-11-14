@@ -55,16 +55,15 @@ final class SubtitleView: NSView {
 
     private let prevLabel = NSTextField(labelWithString: "")
     private let mainLabel = NSTextField(labelWithString: "")
-    /// 影子层：和主字幕同样的文字、稍微偏下并模糊，只显示刚出现的词。
-    /// 新词先在这一层以影子出现，再在主字幕上凝成清晰的字。
-    private let ghostLabel = NSTextField(labelWithString: "")
-    private var births: [CFTimeInterval] = []        // mainText 里每个字符出现的时刻
+    /// 正在说的那一句：最新的词最浅，越早说出来的越深；一句定稿（写进文档）后整句变成全白。
+    /// alphas 是每个字符现在的深浅，targets 是它应该到的深浅，定时器让前者平滑地追上后者。
+    private var alphas: [Double] = []
+    private var targets: [Double] = []
     private var shownChars: [Character] = []         // 实际显示的文字（太长时是「…」加结尾部分）
     private var shownOffset = 0                      // shownChars 对应 mainText 的起始位置
     private var shownTruncated = false
     private var animationTimer: Timer?
-    private static let appearDuration: CFTimeInterval = 0.95
-    private static let ghostColor = NSColor(srgbRed: 1.0, green: 0.52, blue: 0.2, alpha: 1)
+    private var lastTick: CFTimeInterval = 0
     private var prevText = ""
     private var mainText = ""
     private let padding: CGFloat = 20
@@ -89,7 +88,7 @@ final class SubtitleView: NSView {
         shadow.shadowBlurRadius = 3
         shadow.shadowOffset = NSSize(width: 0, height: -1)
 
-        for label in [prevLabel, ghostLabel, mainLabel] {
+        for label in [prevLabel, mainLabel] {
             label.alignment = .center
             label.lineBreakMode = .byWordWrapping
             label.maximumNumberOfLines = 0
@@ -101,38 +100,41 @@ final class SubtitleView: NSView {
             addSubview(label)
         }
         mainLabel.textColor = .white
-        ghostLabel.shadow = nil
-        ghostLabel.wantsLayer = true
-        ghostLabel.layerUsesCoreImageFilters = true
-        if let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 3]) {
-            ghostLabel.contentFilters = [blur]
-        }
-        ghostLabel.isHidden = true
         prevLabel.textColor = NSColor.white.withAlphaComponent(0.6)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func set(previous: String, current: String) {
-        guard previous != prevText || current != mainText else { return }
-        // 和上一次相同的开头保持不动，后面新出现（或被改写）的字符记下出现时刻，按词依次显形
+    /// settled = false 表示 current 是正在识别、还没定稿的半句：结尾的词由浅到深渐变。
+    func set(previous: String, current: String, settled: Bool = true) {
+        guard previous != prevText || current != mainText || settled != lastSettled else { return }
+        lastSettled = settled
         let old = Array(mainText), new = Array(current)
         var same = 0
-        while same < min(old.count, new.count), same < births.count, old[same] == new[same] { same += 1 }
-        let now = CACurrentMediaTime()
+        while same < min(old.count, new.count), same < alphas.count, old[same] == new[same] { same += 1 }
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        var updated = Array(births.prefix(same))
-        var delay: CFTimeInterval = 0
-        for ch in new[same...] {
-            updated.append(reduceMotion ? 0 : now + delay)
-            if ch.isWhitespace { delay = min(delay + 0.045, 0.45) }
-            else if ch.unicodeScalars.first.map({ $0.value >= 0x2E80 }) == true { delay = min(delay + 0.03, 0.45) }   // 中日韩文字按字
+
+        // 目标深浅：定稿的文字全白；半句里，后面还有几个词就有多深（最新的词最浅）
+        var goal = [Double](repeating: 1, count: new.count)
+        if !settled && !reduceMotion {
+            var depth = 0.0
+            for i in stride(from: new.count - 1, through: 0, by: -1) {
+                let ch = new[i]
+                goal[i] = min(1, 0.22 + depth)
+                if ch.isWhitespace { depth += 0.13 }                                                   // 英文等：按词
+                else if ch.unicodeScalars.first.map({ $0.value >= 0x2E80 }) == true { depth += 0.06 }   // 中日韩文字：按字
+                if depth >= 0.78 { break }
+            }
         }
-        births = updated
+        // 没变的开头保持现在的深浅，新出现（或被改写）的字符从透明开始
+        alphas = Array(alphas.prefix(same)) + [Double](repeating: reduceMotion ? 1 : 0, count: new.count - same)
+        if reduceMotion { alphas = goal }
+        targets = goal
         prevText = previous
         mainText = current
         needsLayout = true
     }
+    private var lastSettled = true
 
     /// 一行旧字幕 + 两行当前字幕所需的高度
     var preferredHeight: CGFloat {
@@ -166,69 +168,58 @@ final class SubtitleView: NSView {
         let mainHeight = Self.textHeight(mainString, font: mainFont, width: measureWidth) + 4
         mainLabel.frame = NSRect(x: padding, y: padding, width: width, height: mainHeight)
         prevLabel.frame = NSRect(x: padding, y: padding + mainHeight + gap, width: width, height: prevLineH + 4)
-        ghostLabel.frame = mainLabel.frame.offsetBy(dx: 0, dy: -max(4, fontSize * 0.3))
 
-        if applyAppearance() { startAnimation() }
+        applyAppearance()
+        if alphas != targets { startAnimation() }
     }
 
-    // MARK: - 新词显形动画
+    // MARK: - 由浅到深
 
-    /// 按每个字符出现了多久，设置主字幕和影子层的透明度。返回是否还有字符在显形中。
-    @discardableResult
-    private func applyAppearance() -> Bool {
-        let now = CACurrentMediaTime()
+    /// 按每个字符现在的深浅重画主字幕
+    private func applyAppearance() {
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
         paragraph.lineBreakMode = .byWordWrapping
-        let main = NSMutableAttributedString(), ghost = NSMutableAttributedString()
-        var animating = false
+        let text = NSMutableAttributedString()
         var run = "", runStep = -1
 
         func flush() {
             guard !run.isEmpty else { return }
-            let p = Double(runStep) / 20
-            // 前 40%：只有影子，很快变浓；之后影子慢慢淡去，字渐渐清晰
-            let mainAlpha = p < 0.4 ? 0 : pow((p - 0.4) / 0.6, 1.2)
-            let ghostAlpha = p >= 1 ? 0 : (p < 0.15 ? p / 0.15 : pow(1 - (p - 0.15) / 0.85, 0.7))
-            main.append(NSAttributedString(string: run, attributes: [
+            text.append(NSAttributedString(string: run, attributes: [
                 .font: mainFont, .paragraphStyle: paragraph,
-                .foregroundColor: NSColor.white.withAlphaComponent(mainAlpha)]))
-            let glow = NSShadow()
-            glow.shadowColor = Self.ghostColor.withAlphaComponent(ghostAlpha)
-            glow.shadowBlurRadius = 20
-            glow.shadowOffset = NSSize(width: 0, height: -2)
-            ghost.append(NSAttributedString(string: run, attributes: [
-                .font: mainFont, .paragraphStyle: paragraph, .shadow: glow,
-                .foregroundColor: Self.ghostColor.withAlphaComponent(ghostAlpha)]))
+                .foregroundColor: NSColor.white.withAlphaComponent(Double(runStep) / 40)]))
             run = ""
         }
-
         for (k, ch) in shownChars.enumerated() {
-            let index = shownTruncated ? (k == 0 ? -1 : shownOffset + k - 1) : k    // 开头的「…」不参与动画
-            var p = 1.0
-            if index >= 0, index < births.count {
-                p = min(1, max(0, (now - births[index]) / Self.appearDuration))
-            }
-            if p < 1 { animating = true }
-            let step = Int(p * 20)
+            let index = shownTruncated ? (k == 0 ? -1 : shownOffset + k - 1) : k    // 开头的「…」始终全白
+            let alpha = index >= 0 && index < alphas.count ? alphas[index] : 1
+            let step = Int((alpha * 40).rounded())
             if step != runStep { flush(); runStep = step }
             run.append(ch)
         }
         flush()
-
-        mainLabel.attributedStringValue = main
-        ghostLabel.attributedStringValue = ghost
-        ghostLabel.isHidden = !animating
-        return animating
+        mainLabel.attributedStringValue = text
     }
 
+    /// 让每个字符的深浅平滑地靠近目标（约 0.6 秒走完全程）
     private func startAnimation() {
         guard animationTimer == nil else { return }
+        lastTick = CACurrentMediaTime()
         let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
-            guard let self, self.applyAppearance() else {
+            guard let self else { timer.invalidate(); return }
+            let now = CACurrentMediaTime()
+            let step = min(0.1, now - self.lastTick) / 0.6
+            self.lastTick = now
+            var moving = false
+            for i in 0..<min(self.alphas.count, self.targets.count) where self.alphas[i] != self.targets[i] {
+                let diff = self.targets[i] - self.alphas[i]
+                self.alphas[i] = abs(diff) <= step ? self.targets[i] : self.alphas[i] + (diff > 0 ? step : -step)
+                moving = true
+            }
+            self.applyAppearance()
+            if !moving {
                 timer.invalidate()
-                self?.animationTimer = nil
-                return
+                self.animationTimer = nil
             }
         }
         RunLoop.main.add(timer, forMode: .common)

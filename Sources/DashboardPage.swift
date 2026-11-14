@@ -272,24 +272,15 @@ button.toggle.on { color: var(--ink); background: var(--fill); }
 .ob-foot .help { flex: 1; min-width: 200px; margin: 0; }
 button.big { font-size: 16px; padding: 12px 26px; }
 
-/* 实时字幕的动画：新词先以影子出现，再凝成字；一句定稿时气泡落定 */
-#live-partial p { position: relative; }
-#live-partial p::after { content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 7px; border-radius: 50%; background: var(--accent);
-  box-shadow: 0 0 10px var(--accent); vertical-align: 1px; animation: breathe 1.1s ease-in-out infinite; }
-.w { display: inline-block; animation: shadow-in 0.75s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
-@keyframes shadow-in {
-  0%   { color: transparent; text-shadow: 0 10px 18px color-mix(in srgb, var(--accent) 80%, transparent); transform: translateY(7px) scale(1.06); opacity: 0; }
-  35%  { color: transparent; text-shadow: 0 5px 10px color-mix(in srgb, var(--ink) 75%, transparent); opacity: 1; }
-  70%  { text-shadow: 0 2px 5px color-mix(in srgb, var(--ink) 45%, transparent); transform: none; }
-  100% { text-shadow: 0 0 0 transparent; transform: none; opacity: 1; }
-}
+/* 实时字幕：正在说的那一句，最新的词最浅，越早说出来的越深；定稿（写进文档）后整句变实 */
+#live-doc .cue.partial p { color: var(--ink); }
+#live-partial p::after { content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 7px; border-radius: 50%; background: var(--faint);
+  vertical-align: 1px; animation: breathe 1.1s ease-in-out infinite; }
+.w { opacity: 0; transition: opacity 0.6s ease; }
 @keyframes breathe { 50% { opacity: 0.25; transform: scale(0.7); } }
-#live-lines .cue.settle p { animation: settle 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
-@keyframes settle {
-  0%   { transform: translateY(6px) scale(0.985); box-shadow: 0 0 0 1px var(--line), 0 14px 30px color-mix(in srgb, var(--accent) 35%, transparent); }
-  100% { transform: none; box-shadow: 0 0 0 1px var(--line), 0 0 0 transparent; }
-}
-@media (prefers-reduced-motion: reduce) { .w, #live-lines .cue.settle p, #live-partial p::after { animation: none; } }
+#live-lines .cue.settle p { animation: settle 0.6s ease both; }
+@keyframes settle { 0% { color: color-mix(in srgb, var(--ink) 55%, transparent); } 100% { color: var(--ink); } }
+@media (prefers-reduced-motion: reduce) { .w { transition: none; } #live-lines .cue.settle p, #live-partial p::after { animation: none; } }
 </style>
 </head>
 <body>
@@ -735,7 +726,7 @@ function renderLiveLines(state) {
     }
   });
 }
-// 正在说的半句：一个词一个词地从影子里显形。只有新出现（或被改写）的词才播放动画
+// 正在说的半句：最新的词最浅，后面每多说一个词，前面的就深一级（约 7 个词后变实）
 const TOKEN = /\s+|[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]|[^\s\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+/g;
 function renderPartial(text) {
   const row = $('live-partial'), p = row.lastElementChild;
@@ -746,14 +737,19 @@ function renderPartial(text) {
   let same = 0;
   while (same < tokens.length && same < nodes.length && nodes[same].textContent === tokens[same]) same++;
   for (const node of nodes.slice(same)) node.remove();
-  let delay = 0;
   for (const token of tokens.slice(same)) {
-    if (/^\s+$/.test(token)) { p.append(token); continue; }
-    const word = el('span', 'w', token);
-    word.style.animationDelay = delay + 'ms';
-    delay = Math.min(delay + 45, 450);                        // 一次来好几个词时，依次显形
-    p.append(word);
+    if (/^\s+$/.test(token)) p.append(token); else p.append(el('span', 'w', token));
   }
+  const words = Array.from(p.querySelectorAll('.w'));
+  const cjk = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/;
+  // 先让新词以透明状态画出来一帧，再设目标深浅，这样它们是「淡入」而不是直接出现
+  requestAnimationFrame(() => {
+    let depth = 0;
+    for (let i = words.length - 1; i >= 0; i--) {
+      words[i].style.opacity = Math.min(1, 0.22 + depth);
+      depth += cjk.test(words[i].textContent) ? 0.06 : 0.13;
+    }
+  });
 }
 
 function renderSettings(state) {
