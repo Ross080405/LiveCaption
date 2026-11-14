@@ -321,13 +321,20 @@ final class Transcriber: NSObject {
             isFinishing = true
             onStateChange?(false)
             onChange?()
-            streamer.finish { [weak self] in
+            var finished = false
+            let finish: (String?) -> Void = { [weak self] problem in
+                guard !finished else { return }
+                finished = true
+                if let problem { Log.write(problem) }
                 guard let self else { return }
                 self.isFinishing = false
                 self.partial = ""
                 self.onChange?()
                 completion?()
             }
+            streamer.finish { finish(nil) }
+            // 保险：最后一句迟迟识别不完也不能让界面一直卡在「正在收尾」
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { finish("停止：等最后一句识别超过 20 秒，放弃等待") }
             return
         }
 

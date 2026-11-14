@@ -247,7 +247,13 @@ final class WhisperStreamer {
         timer?.invalidate()
         timer = nil
         finishing = true
-        finishCompletion = completion
+        // 调用方在调用 finish 后就不再持有这个对象了。如果此刻正好有一次识别在进行，
+        // 它的回调只弱引用 self，对象会先被释放，completion 就永远不会被调用（表现为暂停 / 结束后卡住）。
+        // 所以让 completion 自己持有 self，直到它被调用为止。
+        finishCompletion = { [self] in
+            _ = self
+            completion()
+        }
         tryFinish()
     }
 
