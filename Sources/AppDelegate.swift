@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let transcriber = Transcriber()
     private let bridge = AgentBridge()
     private let recording = RecordingFile()
+    private let dashboard = DashboardServer()
+    /// 最近一次错误（给控制台显示）
+    private var lastError: (id: Int, message: String)?
+    private var whisperPreloadStatus: String?
     private var hotKey: HotKey?
     private var recordHotKey: HotKey?
 
@@ -151,10 +155,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         Log.startSession()
         Log.write("日志文件 \(Log.fileURL.path)")
+        startDashboard()
+        if dashboardOnLaunch && !defaults.bool(forKey: "autostart") { openDashboard() }
         // 调试用：open LiveCaption.app --args -autostart YES  启动后立刻开始新记录
         if defaults.bool(forKey: "autostart") {
             DispatchQueue.main.async { [weak self] in self?.startNewRecording() }
         }
+    }
+
+    /// 应用已在运行时再次打开它（访达 / 启动台里双击）：打开控制台
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openDashboard()
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -285,6 +297,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === self.menu else { return }
         menu.removeAllItems()
+
+        if let url = dashboard.url {
+            menu.addItem(item("打开控制台（\(url.host ?? "localhost"):\(dashboard.port)）", #selector(openDashboard)))
+            menu.addItem(.separator())
+        }
 
         switch recordState {
         case .idle:
@@ -701,9 +718,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 会前先把模型下好、加载好，开始记录时就不用等
     @objc private func preloadWhisper() {
+        whisperPreloadStatus = "正在准备 Whisper 模型…"
         WhisperEngine.shared.prepare(model: whisperModel, status: { [weak self] message in
+            self?.whisperPreloadStatus = message
             self?.showToast(message)
         }) { [weak self] error in
+            self?.whisperPreloadStatus = nil
             if let error {
                 self?.showError(TranscriberError(message: error, settingsAnchor: nil))
             } else {
@@ -780,6 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showError(_ error: TranscriberError) {
         Log.write("错误弹窗：\(error.message.replacingOccurrences(of: "\n", with: " "))")
+        lastError = ((lastError?.id ?? 0) + 1, error.message)
         refreshSubtitle()
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -796,5 +817,230 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
             NSWorkspace.shared.open(url)
         }
+    }
+}
+
+// MARK: - 控制台（http://localhost 上的 dashboard）
+
+extension AppDelegate {
+    private var dashboardOnLaunch: Bool {
+        get { defaults.object(forKey: "dashboardOnLaunch") == nil ? true : defaults.bool(forKey: "dashboardOnLaunch") }
+        set { defaults.set(newValue, forKey: "dashboardOnLaunch") }
+    }
+
+    private func startDashboard() {
+        dashboard.handler = { [weak self] request in
+            self?.handleDashboard(request) ?? .error(404, "not found")
+        }
+        dashboard.start()
+    }
+
+    @objc private func openDashboard() {
+        guard let url = dashboard.url else {
+            showError(TranscriberError(message: "控制台没有启动成功（本机端口被占用）。详见 \(Log.fileURL.path)", settingsAnchor: nil))
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func handleDashboard(_ request: HTTPRequest) -> HTTPResponse {
+        switch (request.method, request.path) {
+        case ("GET", "/"), ("GET", "/index.html"):
+            return .text(DashboardPage.html, type: "text/html; charset=utf-8")
+        case ("GET", "/api/state"):
+            return .json(dashboardState())
+        case ("GET", "/api/recordings"):
+            return .json(["recordings": dashboardRecordings()])
+        case ("GET", "/api/recording"):
+            guard let url = recordingURL(named: request.query["name"] ?? ""),
+                  let text = try? String(contentsOf: url, encoding: .utf8) else {
+                return .error(404, "找不到这个记录文件")
+            }
+            return .json(["name": url.lastPathComponent, "text": text])
+        case ("POST", "/api/action"):
+            return dashboardAction(request.json)
+        case ("POST", "/api/settings"):
+            return dashboardApplySettings(request.json)
+        default:
+            return .error(404, "not found")
+        }
+    }
+
+    // MARK: 状态
+
+    private func dashboardState() -> [String: Any] {
+        let state: String
+        switch recordState {
+        case .idle: state = "idle"
+        case .recording: state = "recording"
+        case .paused: state = "paused"
+        }
+        let supported = Set(SFSpeechRecognizer.supportedLocales().map {
+            $0.identifier.replacingOccurrences(of: "_", with: "-")
+        })
+        let lines = transcriber.lines
+        let whisper = WhisperEngine.shared
+        var result: [String: Any] = [
+            "state": state,
+            "starting": transcriber.isStarting,
+            "finishing": transcriber.isFinishing,
+            "running": transcriber.isRunning,
+            "status": transcriber.statusMessage ?? "",
+            "receiving": transcriber.isReceivingAudio,
+            "level": Double(transcriber.inputLevel),
+            "onDevice": transcriber.isOnDevice,
+            "activeEngine": transcriber.recognitionEngine.rawValue,
+            "currentFile": recording.displayName,
+            "lineCount": lines.count,
+            "lines": lines.suffix(200).map { ["time": RecordingFile.timeFormatter.string(from: $0.start), "text": $0.text] },
+            "partial": transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines),
+            "folder": recording.folder.path,
+            "settings": [
+                "source": source.rawValue,
+                "locale": localeID,
+                "engine": recognitionEngine.rawValue,
+                "whisperModel": whisperModel,
+                "whisperAuto": whisperAutoLanguage,
+                "fontSize": Double(fontSize),
+                "opacity": Double(opacity),
+                "clickThrough": clickThrough,
+                "panelVisible": panel.isVisible,
+                "dashboardOnLaunch": dashboardOnLaunch,
+            ],
+            "options": [
+                "sources": [["id": "microphone", "name": "麦克风"],
+                            ["id": "systemAudio", "name": "系统声音（视频 / 会议 / 直播）"]],
+                "languages": languages.map {
+                    ["id": $0.id, "name": $0.name, "supported": supported.isEmpty || supported.contains($0.id)] as [String: Any]
+                },
+                "engines": [["id": "apple", "name": "系统识别", "note": "快、省电，本机识别"],
+                            ["id": "whisper", "name": "Whisper 高精度", "note": "口音、中英混说更准，首次需下载模型"]],
+                "models": WhisperEngine.models.map { model -> [String: Any] in
+                    let saved = defaults.string(forKey: "whisperFolder.\(model.id)")
+                    let downloaded = saved.map { FileManager.default.fileExists(atPath: $0) } ?? false
+                    return ["id": model.id, "name": model.name, "downloaded": downloaded,
+                            "loaded": whisper.loadedModel == model.id]
+                },
+                "fontSizes": fontSizes.map { ["value": Double($0.size), "name": $0.name] as [String: Any] },
+                "opacities": opacities.map { ["value": Double($0.value), "name": $0.name] as [String: Any] },
+            ],
+            "whisper": [
+                "loadedModel": whisper.loadedModel ?? "",
+                "loading": whisper.isLoading,
+                "status": whisperPreloadStatus ?? transcriber.statusMessage ?? "",
+            ],
+            "ai": [
+                "app": bridge.selectedApp?.name ?? "",
+                "requests": [AgentBridge.Request.transcriptOnly, .summarize, .actionItems].map(\.title),
+            ],
+        ]
+        if let lastError { result["error"] = ["id": lastError.id, "message": lastError.message] }
+        return result
+    }
+
+    // MARK: 记录文件
+
+    private func dashboardRecordings() -> [[String: Any]] {
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: recording.folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
+        let latest = recording.latestFile.lastPathComponent
+        return items
+            .filter { ["md", "txt"].contains($0.pathExtension.lowercased()) && $0.lastPathComponent != latest }
+            .map { url -> (URL, Date, Int) in
+                let values = try? url.resourceValues(forKeys: Set(keys))
+                return (url, values?.contentModificationDate ?? .distantPast, values?.fileSize ?? 0)
+            }
+            .sorted { $0.1 > $1.1 }
+            .prefix(300)
+            .map { ["name": $0.0.lastPathComponent,
+                    "modified": RecordingFile.fullFormatter.string(from: $0.1),
+                    "size": $0.2,
+                    "active": $0.0.lastPathComponent == recording.displayName] }
+    }
+
+    /// 只允许访问记录文件夹里的 .md / .txt（文件名不能带路径）
+    private func recordingURL(named name: String) -> URL? {
+        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix("."),
+              ["md", "txt"].contains((name as NSString).pathExtension.lowercased()) else { return nil }
+        let url = recording.folder.appendingPathComponent(name)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    // MARK: 动作
+
+    private func dashboardAction(_ body: [String: Any]) -> HTTPResponse {
+        let action = body["action"] as? String ?? ""
+        Log.write("控制台动作：\(action)")
+        switch action {
+        case "start": startNewRecording()
+        case "pause": pauseRecording()
+        case "resume": resumeRecording()
+        case "end": endRecording()
+        case "continue":
+            guard let url = recordingURL(named: body["name"] as? String ?? "") else { return .error(404, "找不到这个记录文件") }
+            guard recordState == .idle else { return .error(409, "请先结束当前记录") }
+            continueRecording(in: url)
+        case "reveal":
+            if let url = recordingURL(named: body["name"] as? String ?? "") {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } else {
+                revealTranscriptFolder()
+            }
+        case "preloadWhisper": preloadWhisper()
+        case "sendToAI":
+            let title = body["request"] as? String ?? ""
+            guard let request = [AgentBridge.Request.transcriptOnly, .summarize, .actionItems].first(where: { $0.title == title })
+            else { return .error(400, "未知的请求") }
+            sendToAI(request)
+        case "resetPosition": resetPosition()
+        case "dismissError": lastError = nil
+        default:
+            return .error(400, "未知的动作：\(action)")
+        }
+        return .json(dashboardState())
+    }
+
+    private func dashboardApplySettings(_ body: [String: Any]) -> HTTPResponse {
+        Log.write("控制台设置：\(body)")
+        if let raw = body["source"] as? String, let kind = AudioSourceKind(rawValue: raw), kind != source {
+            source = kind
+            restartIfRunning()
+        }
+        if let id = body["locale"] as? String, languages.contains(where: { $0.id == id }), id != localeID {
+            localeID = id
+            restartIfRunning()
+        }
+        if let raw = body["engine"] as? String, let kind = RecognitionEngine(rawValue: raw), kind != recognitionEngine {
+            recognitionEngine = kind
+            restartIfRunning()
+        }
+        if let id = body["whisperModel"] as? String, WhisperEngine.models.contains(where: { $0.id == id }), id != whisperModel {
+            whisperModel = id
+            if recognitionEngine == .whisper { restartIfRunning() }
+        }
+        if let auto = body["whisperAuto"] as? Bool, auto != whisperAutoLanguage {
+            whisperAutoLanguage = auto
+            if recognitionEngine == .whisper { restartIfRunning() }
+        }
+        if let size = body["fontSize"] as? Double, fontSizes.contains(where: { Double($0.size) == size }) {
+            fontSize = CGFloat(size)
+            panel.subtitleView.fontSize = fontSize
+            panel.fitHeightToFont()
+        }
+        if let value = body["opacity"] as? Double, (0...1).contains(value) {
+            opacity = CGFloat(value)
+            panel.subtitleView.backgroundOpacity = opacity
+        }
+        if let locked = body["clickThrough"] as? Bool {
+            clickThrough = locked
+            panel.ignoresMouseEvents = locked
+        }
+        if let visible = body["panelVisible"] as? Bool {
+            if visible { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
+        }
+        if let open = body["dashboardOnLaunch"] as? Bool { dashboardOnLaunch = open }
+        refreshSubtitle()
+        return .json(dashboardState())
     }
 }

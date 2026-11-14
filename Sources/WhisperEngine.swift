@@ -37,6 +37,7 @@ final class WhisperEngine: @unchecked Sendable {
     private let defaults = UserDefaults.standard
 
     var isLoaded: Bool { pipe != nil }
+    var isLoading: Bool { loadingModel != nil }
 
     // MARK: - 下载 / 加载
 
