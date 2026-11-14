@@ -271,6 +271,25 @@ button.toggle.on { color: var(--ink); background: var(--fill); }
 .ob-foot { display: flex; align-items: center; gap: 14px; margin-top: 28px; flex-wrap: wrap; }
 .ob-foot .help { flex: 1; min-width: 200px; margin: 0; }
 button.big { font-size: 16px; padding: 12px 26px; }
+
+/* 实时字幕的动画：新词先以影子出现，再凝成字；一句定稿时气泡落定 */
+#live-partial p { position: relative; }
+#live-partial p::after { content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 7px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 10px var(--accent); vertical-align: 1px; animation: breathe 1.1s ease-in-out infinite; }
+.w { display: inline-block; animation: shadow-in 0.75s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+@keyframes shadow-in {
+  0%   { color: transparent; text-shadow: 0 10px 18px color-mix(in srgb, var(--accent) 80%, transparent); transform: translateY(7px) scale(1.06); opacity: 0; }
+  35%  { color: transparent; text-shadow: 0 5px 10px color-mix(in srgb, var(--ink) 75%, transparent); opacity: 1; }
+  70%  { text-shadow: 0 2px 5px color-mix(in srgb, var(--ink) 45%, transparent); transform: none; }
+  100% { text-shadow: 0 0 0 transparent; transform: none; opacity: 1; }
+}
+@keyframes breathe { 50% { opacity: 0.25; transform: scale(0.7); } }
+#live-lines .cue.settle p { animation: settle 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+@keyframes settle {
+  0%   { transform: translateY(6px) scale(0.985); box-shadow: 0 0 0 1px var(--line), 0 14px 30px color-mix(in srgb, var(--accent) 35%, transparent); }
+  100% { transform: none; box-shadow: 0 0 0 1px var(--line), 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .w, #live-lines .cue.settle p, #live-partial p::after { animation: none; } }
 </style>
 </head>
 <body>
@@ -326,7 +345,11 @@ button.big { font-size: 16px; padding: 12px 26px; }
           <div class="session-status" id="s-status"></div>
           <div class="meter" id="meter"><i></i></div>
         </div></div>
-        <div class="doc" id="live-doc"></div>
+        <div class="doc" id="live-doc">
+          <div id="live-lines"></div>
+          <div class="cue partial" id="live-partial" hidden><time></time><p></p></div>
+          <p class="quiet" id="live-note" hidden></p>
+        </div>
         <div class="live-foot" id="live-foot"></div>
       </div>
       <button class="latest" id="latest" hidden>↓ 回到最新</button>
@@ -604,13 +627,11 @@ function render(state) {
     if (liveSig !== lastLiveSig) {
       lastLiveSig = liveSig;
       const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80;
-      const box = $('live-doc');
-      box.replaceChildren();
-      const cue = (time, text, cls) => { const row = el('div', 'cue' + (cls ? ' ' + cls : '')); row.append(el('time', '', time), el('p', '', text)); box.append(row); };
-      for (const line of state.lines) cue(line.time, line.text);
-      if (state.partial) cue('', state.partial, 'partial');
-      if (state.status) box.append(el('p', 'quiet', state.status));
-      else if (!state.lines.length && !state.partial) box.append(el('p', 'quiet', state.running ? '正在聆听…说的话会出现在这里。' : ''));
+      renderLiveLines(state);
+      renderPartial(state.partial);
+      const note = state.status || (!state.lines.length && !state.partial && state.running ? '正在聆听…说的话会出现在这里。' : '');
+      $('live-note').hidden = !note;
+      $('live-note').textContent = note;
       if (!doc) { if (atBottom) window.scrollTo(0, document.documentElement.scrollHeight); else $('latest').hidden = false; }
     }
 
@@ -693,6 +714,46 @@ function renderOnboarding(state) {
   $('ob-note').textContent = !canListen ? '先允许麦克风，才能开始。'
     : needsSpeech ? '「系统识别」还需要允许语音识别。'
     : state.settings.engine === 'whisper' && !(model && model.loaded) ? '模型没准备好也可以先开始，第一次记录时会自动下载。' : '都准备好了。';
+}
+
+// ---------- 实时字幕的动画 ----------
+// 已定稿的句子：只增量更新，新的一句「落定」时气泡亮一下
+function renderLiveLines(state) {
+  const box = $('live-lines');
+  const base = state.lineCount - state.lines.length;          // 第一行在整场记录里的序号
+  const fresh = box.dataset.base !== String(base) || box.childElementCount > state.lines.length;
+  if (fresh) { box.replaceChildren(); box.dataset.base = base; }
+  const animate = !fresh || state.lines.length <= 1;          // 刚打开页面时已有的句子不用动画
+  state.lines.forEach((line, i) => {
+    let row = box.children[i];
+    if (!row) {
+      row = el('div', 'cue' + (animate ? ' settle' : ''));
+      row.append(el('time', '', line.time), el('p', '', line.text));
+      box.append(row);
+    } else if (row.lastElementChild.textContent !== line.text) {
+      row.lastElementChild.textContent = line.text;           // 后台校正了上一句
+    }
+  });
+}
+// 正在说的半句：一个词一个词地从影子里显形。只有新出现（或被改写）的词才播放动画
+const TOKEN = /\s+|[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]|[^\s\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+/g;
+function renderPartial(text) {
+  const row = $('live-partial'), p = row.lastElementChild;
+  row.hidden = !text;
+  if (!text) { p.replaceChildren(); return; }
+  const tokens = text.match(TOKEN) || [];
+  const nodes = Array.from(p.childNodes);
+  let same = 0;
+  while (same < tokens.length && same < nodes.length && nodes[same].textContent === tokens[same]) same++;
+  for (const node of nodes.slice(same)) node.remove();
+  let delay = 0;
+  for (const token of tokens.slice(same)) {
+    if (/^\s+$/.test(token)) { p.append(token); continue; }
+    const word = el('span', 'w', token);
+    word.style.animationDelay = delay + 'ms';
+    delay = Math.min(delay + 45, 450);                        // 一次来好几个词时，依次显形
+    p.append(word);
+  }
 }
 
 function renderSettings(state) {
