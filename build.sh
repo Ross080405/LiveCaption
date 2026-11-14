@@ -24,8 +24,16 @@ done
 # 钥匙串里有本机自签名证书「LiveCaption Local Signing」就用它，这样重新编译后权限还在；
 # 没有就退回临时签名（ad-hoc）——能用，但每次重新编译都要重新授权。
 # 创建证书的方法见 README。
-IDENTITY="LiveCaption Local Signing"
-if security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; then
+#
+# 给别人用的版本（scripts/make-dmg.sh 会设置这些环境变量）：
+#   SIGN_IDENTITY="-"                         临时签名：没有开发者账号时用，对方第一次打开要手动放行
+#   SIGN_IDENTITY="Developer ID Application: 名字 (TEAMID)"   正式签名，可以再做公证
+IDENTITY="${SIGN_IDENTITY:-LiveCaption Local Signing}"
+if [[ "$IDENTITY" == Developer\ ID* ]]; then
+  # 公证要求：加固运行时（hardened runtime）+ 时间戳；麦克风等能力写在 entitlements 里
+  codesign --force --options runtime --timestamp --entitlements scripts/LiveCaption.entitlements --sign "$IDENTITY" "$APP"
+  echo "→ 已用「$IDENTITY」签名（加固运行时）"
+elif [ "$IDENTITY" != "-" ] && security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; then
   codesign --force --sign "$IDENTITY" "$APP"
   echo "→ 已用「$IDENTITY」签名"
 else
@@ -37,7 +45,9 @@ echo "✓ 完成：$APP"
 
 # 「应用程序」里装过的话，顺手更新那一份（第一次安装：./build.sh --install）
 INSTALLED="/Applications/LiveCaption.app"
-if [ -d "$INSTALLED" ] || [ "${1:-}" = "--install" ]; then
+if [ -n "${NO_INSTALL:-}" ]; then
+  :   # 只打包，不动「应用程序」里正在用的那一份
+elif [ -d "$INSTALLED" ] || [ "${1:-}" = "--install" ]; then
   pkill -x LiveCaption 2>/dev/null && sleep 1 || true
   rm -rf "$INSTALLED"
   ditto "$APP" "$INSTALLED"

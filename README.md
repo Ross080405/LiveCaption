@@ -47,6 +47,19 @@ macOS 是按签名来认应用的。默认的临时签名（ad-hoc）每次编�
 
 > ⚠️ 请用 `open` 或双击启动，不要在终端里直接运行里面的二进制文件，否则权限会被记到「终端」名下。
 
+## 打包给别人用
+```bash
+./scripts/make-dmg.sh
+```
+生成 `build/LiveCaption-版本号.dmg`，不会动「应用程序」里你自己在用的那一份。对方不需要 Xcode，拖进「应用程序」即可；第一次打开时窗口里有引导，带着允许权限、选识别引擎。
+
+- **没有 Apple 开发者账号**（默认）：临时签名。对方第一次打开会被系统拦下，需要按安装包里的「首次打开说明.txt」到「系统设置 → 隐私与安全性」点一次「仍要打开」。
+- **有开发者账号**：正式签名加公证，对方双击就能打开（这条路径还没有实际跑过）：
+  ```bash
+  xcrun notarytool store-credentials livecaption     # 只需一次，按提示输入 Apple ID、团队 ID、App 专用密码
+  SIGN_IDENTITY="Developer ID Application: 你的名字 (TEAMID)" NOTARY_PROFILE=livecaption ./scripts/make-dmg.sh
+  ```
+
 ## 使用
 1. 启动后菜单栏会出现一个 💬 字幕图标，屏幕下方出现字幕条。
 2. 点菜单栏图标（或在字幕条上**右键**）→ **开始字幕**。

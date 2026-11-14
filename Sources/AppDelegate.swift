@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Speech
 import UniformTypeIdentifiers
 import Carbon
@@ -190,8 +191,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startDashboard()
         // 稍等一下再决定要不要打开控制台：如果是控制台页面上的「打开 LiveCaption」把应用叫起来的，
         // 那个页面会自己恢复，不用再开一个标签页
+        // 老用户（已经给过麦克风或系统录音权限）不用再看新手引导
+        if defaults.object(forKey: "onboarded") == nil,
+           AVCaptureDevice.authorizationStatus(for: .audio) == .authorized || CGPreflightScreenCaptureAccess() {
+            onboarded = true
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, self.dashboardOnLaunch, !self.launchedByURL,
+            guard let self, self.dashboardOnLaunch || !self.onboarded, !self.launchedByURL,
                   !self.defaults.bool(forKey: "autostart") else { return }
             self.openDashboard()
         }
@@ -948,6 +954,60 @@ extension AppDelegate {
         dashboard.start()
     }
 
+    // MARK: 新手引导和权限
+
+    /// 第一次打开时在主窗口里显示引导：权限、识别引擎
+    private var onboarded: Bool {
+        get { defaults.bool(forKey: "onboarded") }
+        set { defaults.set(newValue, forKey: "onboarded") }
+    }
+
+    /// 每项权限的状态："granted" 已允许 / "ask" 还没问过 / "denied" 被拒绝 / "pending" 已去设置，等重新打开应用
+    private func permissionStates() -> [String: String] {
+        func name(_ authorized: Bool, _ undetermined: Bool) -> String { authorized ? "granted" : undetermined ? "ask" : "denied" }
+        let mic = AVCaptureDevice.authorizationStatus(for: .audio)
+        let speech = SFSpeechRecognizer.authorizationStatus()
+        return [
+            "microphone": name(mic == .authorized, mic == .notDetermined),
+            "speech": name(speech == .authorized, speech == .notDetermined),
+            "screen": CGPreflightScreenCaptureAccess() ? "granted" : defaults.bool(forKey: "screenRequested") ? "pending" : "ask",
+        ]
+    }
+
+    private func openPrivacySettings(_ anchor: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 还没问过就弹系统的授权提示；已经被拒绝过（系统不会再弹）就打开系统设置对应的页面
+    private func requestPermission(_ kind: String) {
+        Log.write("请求权限：\(kind)")
+        switch kind {
+        case "microphone":
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+                AVCaptureDevice.requestAccess(for: .audio) { _ in }
+            } else {
+                openPrivacySettings("Privacy_Microphone")
+            }
+        case "speech":
+            if SFSpeechRecognizer.authorizationStatus() == .notDetermined {
+                SFSpeechRecognizer.requestAuthorization { _ in }
+            } else {
+                openPrivacySettings("Privacy_SpeechRecognition")
+            }
+        case "screen":
+            // 第一次调用会弹系统提示，并让 LiveCaption 出现在系统设置的列表里；之后只能去设置里手动打开
+            if defaults.bool(forKey: "screenRequested") {
+                openPrivacySettings("Privacy_ScreenCapture")
+            } else {
+                defaults.set(true, forKey: "screenRequested")
+                CGRequestScreenCaptureAccess()
+            }
+        default: break
+        }
+    }
+
     @objc private func openDashboard() {
         guard let url = dashboard.url else {
             showError(TranscriberError(message: "控制台没有启动成功（本机端口被占用）。详见 \(Log.fileURL.path)", settingsAnchor: nil))
@@ -1015,6 +1075,7 @@ extension AppDelegate {
                 "preview": RecordingFile.expand(namePattern, date: Date(), context: nameContext) + ".md",
                 "tokens": RecordingFile.patternTokens.map { ["token": $0.token, "note": $0.note] },
             ] as [String: Any],
+            "onboarding": ["show": !onboarded, "permissions": permissionStates()] as [String: Any],
             "lineCount": lines.count,
             "lines": lines.suffix(200).map { ["time": RecordingFile.timeFormatter.string(from: $0.start), "text": $0.text] },
             "partial": transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1158,6 +1219,11 @@ extension AppDelegate {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(text, forType: .string)
         case "preloadWhisper": preloadWhisper()
+        case "requestPermission": requestPermission(body["kind"] as? String ?? "")
+        case "finishOnboarding": onboarded = true
+        case "showOnboarding": onboarded = false
+        case "relaunch":
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.relaunch() }
         case "sendToAI":
             let title = body["request"] as? String ?? ""
             guard let request = [AgentBridge.Request.transcriptOnly, .summarize, .actionItems].first(where: { $0.title == title })

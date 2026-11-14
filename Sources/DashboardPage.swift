@@ -255,6 +255,22 @@ button.toggle.on { color: var(--ink); background: var(--fill); }
 
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 50; background: var(--ink); color: var(--bg); border-radius: 999px; padding: 10px 20px; font-size: 14px; font-weight: 500; box-shadow: var(--shadow); max-width: calc(100vw - 32px); }
 .drop { position: fixed; inset: 12px; z-index: 60; border: 2px dashed var(--accent); border-radius: 30px; background: color-mix(in srgb, var(--bg) 88%, transparent); display: grid; place-items: center; font: 600 20px var(--ui); letter-spacing: -0.02em; pointer-events: none; }
+.onboard { position: fixed; inset: 0; z-index: 70; background: var(--bg); overflow-y: auto; display: grid; justify-items: center; align-items: start; padding: 48px 20px; }
+.onboard-card { width: min(580px, 100%); margin: auto 0; }
+.onboard-card > img { border-radius: 22px; display: block; margin-bottom: 20px; }
+.onboard h1 { font-size: 32px; line-height: 1.2; letter-spacing: -0.03em; margin: 0 0 8px; }
+.onboard .lead { font-size: 17px; color: var(--muted); margin: 0 0 28px; }
+.onboard h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 26px 10px 8px; }
+.perm { display: flex; align-items: center; gap: 14px; padding: 14px 0; border-top: 1px solid var(--line); }
+.perm:first-child { border-top: 0; }
+.perm > div:first-child { flex: 1; min-width: 0; }
+.perm b { font-weight: 600; }
+.perm small { display: block; color: var(--muted); font-size: 13px; margin-top: 1px; }
+.perm .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.perm .badge { font-size: 13px; padding: 5px 13px; }
+.ob-foot { display: flex; align-items: center; gap: 14px; margin-top: 28px; flex-wrap: wrap; }
+.ob-foot .help { flex: 1; min-width: 200px; margin: 0; }
+button.big { font-size: 16px; padding: 12px 26px; }
 </style>
 </head>
 <body>
@@ -373,8 +389,26 @@ button.toggle.on { color: var(--ink); background: var(--fill); }
   <h2>通用</h2>
   <div class="group">
   <div class="row"><label for="dashboardOnLaunch">启动时打开主窗口</label><span class="switch"><input type="checkbox" id="dashboardOnLaunch"><i></i></span></div>
+  <div class="row"><span class="label">权限和新手引导</span><button id="ob-reopen">重新查看</button></div>
   </div>
 </aside>
+
+<div class="onboard" id="onboard" hidden>
+  <div class="onboard-card">
+    <img src="/icon.png" alt="" width="76" height="76">
+    <h1>欢迎使用 LiveCaption</h1>
+    <p class="lead">把听到的声音实时变成字幕。识别全部在这台 Mac 上完成，音频不会上传。</p>
+    <h2>先允许它听声音</h2>
+    <div class="group" id="ob-perms"></div>
+    <h2>选一个识别引擎（以后可以在设置里换）</h2>
+    <div id="ob-engines"></div>
+    <div class="ob-foot">
+      <button class="primary big" id="ob-done">开始使用</button>
+      <p class="help" id="ob-note"></p>
+      <button class="link" id="ob-skip" style="font-size:14px">跳过</button>
+    </div>
+  </div>
+</div>
 
 <div class="toast" id="toast" hidden></div>
 <div class="drop" id="drop" hidden>松手预览这个 Markdown 文件</div>
@@ -392,6 +426,7 @@ const pad = n => String(n).padStart(2, '0');
 let S = null;            // 应用状态（每 0.3 秒刷新）
 let recs = [];           // 记录库
 let doc = null;          // 阅读视图里打开的：{ name, text, local }
+let lastOnboardSig = '';
 let dismissedError = 0, lastSettingsSig = '', lastButtonsSig = '', lastLiveSig = '', lastListSig = '';
 
 // ---------- 和应用通信 ----------
@@ -592,9 +627,71 @@ function render(state) {
 
   if (state.error && state.error.id !== dismissedError) { $('banner').dataset.id = state.error.id; showBanner(state.error.message); }
 
+  renderOnboarding(state);
   $('pattern-preview').textContent = state.naming.preview;
   const settingsSig = JSON.stringify([state.settings, state.options, state.whisper, state.running, state.naming.mode, state.naming.pattern, state.folder]);
   if (settingsSig !== lastSettingsSig) { lastSettingsSig = settingsSig; renderSettings(state); }
+}
+
+// ---------- 新手引导 ----------
+const PERMS = [
+  { id: 'microphone', name: '麦克风', note: '听现场的声音：上课、开会、面对面交谈。' },
+  { id: 'speech', name: '语音识别', note: '使用「系统识别」引擎时需要。' },
+  { id: 'screen', name: '系统声音（可选）', note: '给视频、网课、线上会议出字幕。需要「屏幕与系统录音」权限，允许后要重新打开应用才生效。' },
+];
+function renderOnboarding(state) {
+  const ob = state.onboarding;
+  $('onboard').hidden = !ob.show;
+  if (!ob.show) { lastOnboardSig = ''; return; }
+  const sig = JSON.stringify([ob.permissions, state.settings.engine, state.settings.whisperModel, state.options.models, state.whisper]);
+  if (sig === lastOnboardSig) return;
+  lastOnboardSig = sig;
+
+  const perms = $('ob-perms');
+  perms.replaceChildren();
+  for (const perm of PERMS) {
+    const status = ob.permissions[perm.id];
+    const row = el('div', 'perm'), text = el('div'), acts = el('div', 'acts');
+    text.append(el('b', '', perm.name), el('small', '', perm.note));
+    const button = (label, action, extra, cls) => { const b = el('button', cls, label); b.onclick = () => act(action, extra); acts.append(b); };
+    if (status === 'granted') acts.append(el('span', 'badge on', '已允许'));
+    else if (status === 'ask') button('允许', 'requestPermission', { kind: perm.id }, perm.id === 'screen' ? '' : 'primary');
+    else {
+      button('打开系统设置', 'requestPermission', { kind: perm.id });
+      if (status === 'pending') button('重新打开应用', 'relaunch', null, 'primary');
+    }
+    row.append(text, acts);
+    perms.append(row);
+  }
+
+  const engines = $('ob-engines');
+  engines.replaceChildren();
+  const model = state.options.models.find(m => m.id === state.settings.whisperModel);
+  for (const engine of state.options.engines) {
+    const on = engine.id === state.settings.engine;
+    const box = el('div', 'choice' + (on ? ' on' : '')), body = el('div');
+    body.style.flex = '1';
+    body.append(el('b', '', engine.name), el('small', '', engine.note));
+    box.append(body);
+    if (engine.id === 'whisper' && on) {
+      const ready = model && model.loaded;
+      const b = el('button', ready ? '' : 'primary', ready ? '模型已就绪 ✓' : state.whisper.loading ? '正在准备…' : model && model.downloaded ? '加载模型' : '下载模型');
+      b.disabled = ready || state.whisper.loading;
+      b.onclick = e => { e.stopPropagation(); act('preloadWhisper'); };
+      box.append(b);
+      if (state.whisper.status) body.append(el('small', '', state.whisper.status));
+    }
+    box.onclick = () => { if (!on) setting({ engine: engine.id }); };
+    engines.append(box);
+  }
+
+  const p = ob.permissions;
+  const canListen = p.microphone === 'granted' || p.screen === 'granted';
+  const needsSpeech = state.settings.engine === 'apple' && p.speech !== 'granted';
+  $('ob-done').disabled = !canListen || needsSpeech;
+  $('ob-note').textContent = !canListen ? '先允许麦克风，才能开始。'
+    : needsSpeech ? '「系统识别」还需要允许语音识别。'
+    : state.settings.engine === 'whisper' && !(model && model.loaded) ? '模型没准备好也可以先开始，第一次记录时会自动下载。' : '都准备好了。';
 }
 
 function renderSettings(state) {
@@ -815,6 +912,9 @@ $('pattern').oninput = e => { clearTimeout(patternTimer); patternTimer = setTime
 $('pattern-reset').onclick = () => { $('pattern').value = S.naming.defaultPattern; setting({ namePattern: S.naming.defaultPattern }); };
 $('folder-reveal').onclick = () => act('reveal');
 $('resetPosition').onclick = () => act('resetPosition');
+$('ob-done').onclick = () => act('finishOnboarding');
+$('ob-skip').onclick = () => act('finishOnboarding');
+$('ob-reopen').onclick = () => { openSheet(false); act('showOnboarding'); };
 for (const key of ['panelVisible', 'clickThrough', 'dashboardOnLaunch']) $(key).onchange = e => setting({ [key]: e.target.checked });
 $('banner-close').onclick = () => {
   dismissedError = Number($('banner').dataset.id || 0);
