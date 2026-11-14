@@ -1,4 +1,4 @@
-/// 控制台页面（单文件 HTML，由 DashboardServer 在 http://localhost 上提供）
+/// 控制台页面（单文件 HTML，由 DashboardServer 在 http://localhost 上提供；应用主窗口里显示的也是它）
 ///
 /// 设计思路：
 /// - 一屏只有一件主要的事：没在记录时是「开始」，记录时是正在出现的字幕。
@@ -372,7 +372,7 @@ button.toggle.on { color: var(--ink); background: var(--fill); }
 
   <h2>通用</h2>
   <div class="group">
-  <div class="row"><label for="dashboardOnLaunch">启动时打开这个页面</label><span class="switch"><input type="checkbox" id="dashboardOnLaunch"><i></i></span></div>
+  <div class="row"><label for="dashboardOnLaunch">启动时打开主窗口</label><span class="switch"><input type="checkbox" id="dashboardOnLaunch"><i></i></span></div>
   </div>
 </aside>
 
@@ -795,6 +795,7 @@ $('r-title').onclick = () => { if (doc && !doc.local) editTitle($('r-title'), do
 $('r-font').onclick = () => { prefs.set('serif', document.body.classList.toggle('serif') ? '1' : '0'); renderReader(); };
 $('r-time').onclick = () => { prefs.set('noTime', document.body.classList.toggle('no-time') ? '1' : '0'); renderReader(); };
 $('r-copy').onclick = async () => {
+  if (!doc.local) { if (await act('copy', { name: doc.name })) toast('已复制全文'); return; }
   try { await navigator.clipboard.writeText(doc.text); toast('已复制全文'); } catch (e) { toast('复制失败'); }
 };
 $('r-continue').onclick = async () => { const name = doc.name; if (await act('continue', { name })) goLive(); };

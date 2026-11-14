@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let bridge = AgentBridge()
     private let recording = RecordingFile()
     private let dashboard = DashboardServer()
+    private let mainWindow = DashboardWindowController()
     /// 最近一次错误（给控制台显示）
     private var lastError: (id: Int, message: String)?
     private var whisperPreloadStatus: String?
@@ -341,8 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard menu === self.menu else { return }
         menu.removeAllItems()
 
-        if let url = dashboard.url {
-            menu.addItem(item("打开控制台（\(url.host ?? "localhost"):\(dashboard.port)）", #selector(openDashboard)))
+        if dashboard.url != nil {
+            menu.addItem(item("打开 LiveCaption 窗口", #selector(openDashboard)))
             menu.addItem(.separator())
         }
 
@@ -952,7 +953,7 @@ extension AppDelegate {
             showError(TranscriberError(message: "控制台没有启动成功（本机端口被占用）。详见 \(Log.fileURL.path)", settingsAnchor: nil))
             return
         }
-        NSWorkspace.shared.open(url)
+        mainWindow.show(url: url)
     }
 
     private func handleDashboard(_ request: HTTPRequest) -> HTTPResponse {
@@ -1150,6 +1151,12 @@ extension AppDelegate {
             } else {
                 revealTranscriptFolder()
             }
+        case "copy":
+            // 页面里的「复制全文」：由应用来写剪贴板，窗口里和浏览器里都能用
+            guard let url = recordingURL(named: body["name"] as? String ?? ""),
+                  let text = try? String(contentsOf: url, encoding: .utf8) else { return .error(404, "找不到这个记录文件") }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
         case "preloadWhisper": preloadWhisper()
         case "sendToAI":
             let title = body["request"] as? String ?? ""

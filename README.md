@@ -34,7 +34,7 @@ open build/LiveCaption.app
 ```
 macOS 是按签名来认应用的。默认的临时签名（ad-hoc）每次编译都不一样，所以每次重新编译后，麦克风 / 语音识别 / 屏幕与系统录音都要重新授权。这个脚本在登录钥匙串里建一个本机自签名证书，`build.sh` 发现它就会用它签名，权限从此跨编译保留。之后第一次编译时系统可能提示「codesign 想要使用密钥」，输入登录密码并点「始终允许」。
 
-打开应用后，浏览器访问 <http://localhost:17890> 是控制台：
+打开应用会出现主窗口（关掉后点菜单栏图标 →「打开 LiveCaption 窗口」，或再次双击应用）。同一个界面也可以在浏览器里访问 <http://localhost:17890>：
 
 - **一屏只做一件事**：没在记录时只有一个「开始」按钮；记录时是正在出现的字幕，标题、计时、暂停 / 结束在顶部。
 - **命名两种方式**（设置 → 保存与命名，或开始按钮下面的链接切换）：
@@ -128,6 +128,9 @@ Sources/
   WhisperEngine.swift       Whisper 模型下载加载 + 按停顿切句的实时识别
   SystemAudioCapture.swift  用 ScreenCaptureKit 采集系统声音
   SubtitleWindow.swift      置顶悬浮字幕条
+  DashboardWindow.swift     应用主窗口（显示控制台页面）
+  DashboardServer.swift     只监听本机的 HTTP 服务
+  DashboardPage.swift       控制台页面（单文件 HTML）
 Package.swift               依赖（WhisperKit 1.1.1）
 Info.plist                  权限说明文字等
 build.sh                    一键编译成 .app
