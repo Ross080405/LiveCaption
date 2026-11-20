@@ -30,7 +30,7 @@ macOS 上的实时字幕。把麦克风或电脑里正在播放的声音变成�
 
 ### 从源码编译
 
-想自己改代码的话（需要 Xcode 16 或更新）：
+想自己改代码的话（本地增强版需要 Xcode 26 / Swift 6.2 或更新）：
 
 ```bash
 ./build.sh --install
@@ -127,3 +127,30 @@ Sources/
 scripts/                    签名证书、打包、图标
 build.sh                    编译并安装
 ```
+
+
+## 本地增强版：实时说话人 + 快速分享
+
+- 开始页或「设置 → 识别」开启 **实时区分说话人**，录音时自动按声音分成 A/B/C/D，最多 4 人。
+- 使用 FluidAudio 0.18.4 的 Sortformer 流式 CoreML 模型；首次从 Hugging Face 下载到 `~/Library/Application Support/LiveCaption/speakers`。分人在本机运行，不上传声音，不识别真实姓名。
+- 标签通常稍晚于文字，随后会校正。`?` /「待识别」表示没有足够声学证据，`A+B` 表示重叠发言。噪声、短句、相似声音及四人以上场景可能分错。
+- 结合系统识别和 Whisper 的词级时间戳，在一句话里发生换人时拆成多行；缺少可靠词级时间戳时，按整段的主要说话人标注。
+- 暂停/继续保持同一组标签；每次新记录重新编号。接着写入旧记录会在新的「继续记录」段中重新编号。只能在结束记录后切换分人开关。
+- 实时录音页与记录阅读页都提供 **复制全文 / 导出 Markdown / 导出 TXT**。导出弹出原生保存窗口；复制直接得到可粘贴的完整文本。
+- 复制、导出和交给 AI 使用同一份完整快照，保留时间戳与说话人标签，也包含明确标注为「识别中」的半句话；不会只复制屏幕上最近 200 行。
+- 结束时先等识别与说话人结果收尾，再写入记录与 `最新字幕.md`。历史记录可通过已有「编辑」功能修正误识别或标签。
+- 原有 ⌥⌘A 是复制提示词与 transcript 并打开选定的桌面 AI，用户再按 ⌘V；不会自动发送消息。
+
+分人关闭时可继续使用原有转写。系统语音识别原有的在线回退机制仍存在；若需要转写也始终本地处理，请选 Whisper。
+
+### 验证
+
+```sh
+swift test
+# 可选：使用合成的两种声音做真实 CoreML 流式推理与暂停/继续测试（首次下载模型）
+LIVE_CAPTION_SPEAKER_FIXTURES=/path/to/fixtures swift test --filter SpeakerIntegrationTests
+```
+
+fixtures 目录应包含 16 kHz 单声道的 `a.wav`、`b.wav`（两个不同声音）；测试按 A → B → 暂停 → A 输入，不使用麦克风。
+
+模型及 SDK 来源：[FluidAudio](https://github.com/FluidInference/FluidAudio)、[Sortformer 使用与限制](https://github.com/FluidInference/FluidAudio/blob/v0.18.4/Documentation/Diarization/Sortformer.md)。

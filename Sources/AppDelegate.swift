@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var launchedByURL = false
     private var hotKey: HotKey?
     private var recordHotKey: HotKey?
+    private var lastCompletedFile: URL?
 
     /// 记录状态：没有记录 / 录音中 / 已暂停（文件还开着，继续会接着写）
     private enum RecordState { case idle, recording, paused }
@@ -86,6 +87,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { defaults.set(newValue, forKey: "whisperAutoLanguage") }
     }
 
+    private var speakerLabels: Bool {
+        get { defaults.object(forKey: "speakerLabels") == nil || defaults.bool(forKey: "speakerLabels") }
+        set { defaults.set(newValue, forKey: "speakerLabels") }
+    }
+
     /// 新记录怎么起名："pattern" 按命名规则自动起名；"ask" 开始前先问名字
     private var namingMode: String {
         get { defaults.string(forKey: "namingMode") == "ask" ? "ask" : "pattern" }
@@ -129,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startTranscriber() {
         transcriber.start(localeID: localeID, source: source,
-                          engine: recognitionEngine, whisper: whisperSettings)
+                          engine: recognitionEngine, whisper: whisperSettings, speakers: speakerLabels)
     }
 
     private var clickThrough: Bool {
@@ -169,7 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             self.refreshSubtitle()
             self.recording.linesChanged(self.transcriber.lines,
-                                        partial: self.transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines))
+                                        partial: self.transcriber.labeledPartial.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         transcriber.onStateChange = { [weak self] running in
             if !running, let self { self.recording.flush(lines: self.transcriber.lines) }
@@ -221,9 +227,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        transcriber.stop()
-        recording.end(lines: transcriber.lines)
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard recording.url != nil else { return .terminateNow }
+        transcriber.stop { [weak self] in
+            guard let self else { sender.reply(toApplicationShouldTerminate: true); return }
+            self.recording.end(lines: self.transcriber.lines)
+            // Reply after this method has returned .terminateLater, even for an already-paused session.
+            DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
     }
 
     // MARK: - 字幕显示
@@ -231,16 +243,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshSubtitle() {
         let view = panel.subtitleView
         let lines = transcriber.lines
-        let partial = transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines)
+        let partial = transcriber.labeledPartial.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let status = transcriber.statusMessage, partial.isEmpty {
-            view.set(previous: "Whisper 高精度识别", current: status)
+            view.set(previous: "正在准备识别", current: status)
             return
         }
         if !partial.isEmpty {
-            view.set(previous: lines.last?.text ?? "", current: partial, settled: false)
+            view.set(previous: lines.last?.labeledText ?? "", current: partial, settled: false)
         } else if let last = lines.last {
-            view.set(previous: lines.count >= 2 ? lines[lines.count - 2].text : "", current: last.text)
+            view.set(previous: lines.count >= 2 ? lines[lines.count - 2].labeledText : "", current: last.labeledText)
         } else if transcriber.isRunning {
             view.set(previous: transcriber.recognitionEngine == .whisper ? "Whisper 高精度 · 本地识别"
                         : (transcriber.isOnDevice ? "本地识别 · 不上传音频" : "在线识别"),
@@ -255,7 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if recordState == .paused && partial.isEmpty {
             view.set(previous: "⏸ 已暂停 · 继续后接着写入 \(recording.displayName)",
-                     current: lines.last?.text ?? "按 ⌥⌘P 继续")
+                     current: lines.last?.labeledText ?? "按 ⌥⌘P 继续")
         }
     }
 
@@ -531,12 +543,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let exportMenu = NSMenu()
         exportMenu.autoenablesItems = false
         for (title, action) in [("复制全部文字", #selector(copyAll)),
+                                ("保存为 Markdown（.md）…", #selector(saveMarkdown)),
                                 ("保存为文本（.txt）…", #selector(saveText)),
                                 ("导出字幕文件（.srt）…", #selector(saveSRT)),
                                 ("清空屏幕上的字幕", #selector(clearAll))] {
             let it = item(title, action)
             // 记录进行中不能清空（文件内容以这些字幕为准）
-            it.isEnabled = hasLines && (action != #selector(clearAll) || recordState == .idle)
+            it.isEnabled = (hasLines || !transcriber.partial.isEmpty) && (action != #selector(clearAll) || recordState == .idle)
             exportMenu.addItem(it)
         }
         menu.addItem(submenu("复制与导出（已记录 \(transcriber.lines.count) 句）", exportMenu))
@@ -561,11 +574,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - 交给桌面 AI
 
     private func sendToAI(_ request: AgentBridge.Request) {
-        recording.flush(lines: transcriber.lines)
-        let file = transcriptFileForAI()
-        let transcript = file.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-            ?? transcriber.lines.map { "[\(RecordingFile.timeFormatter.string(from: $0.start))] \($0.text)" }.joined(separator: "\n")
-        showToast(bridge.send(request, transcript: transcript, file: file))
+        do {
+            let snapshot = try transcriptSnapshot()
+            showToast(bridge.send(request, transcript: snapshot.markdown, file: transcriptFileForAI()))
+        } catch { showToast(error.localizedDescription) }
     }
 
     @objc private func sendToAIItem(_ sender: NSMenuItem) {
@@ -672,7 +684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 菜单 / 快捷键：按「命名方式」决定要不要先问名字
     @objc private func startNewRecording() {
-        guard recordState == .idle else { return }
+        guard recordState == .idle, !transcriber.isFinishing else { return }
         if namingMode == "ask" {
             guard let title = askForTitle() else { return }
             beginNewRecording(title: title)
@@ -683,7 +695,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// title 为空就按命名规则自动起名
     private func beginNewRecording(title: String?) {
-        guard recordState == .idle else { return }
+        guard recordState == .idle, !transcriber.isFinishing else { return }
         recording.beginNew(title: title, pattern: namePattern, context: nameContext)
         transcriber.clear()
         accumulatedSeconds = 0
@@ -726,7 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func continueRecording(in file: URL) {
-        guard recordState == .idle else { return }
+        guard recordState == .idle, !transcriber.isFinishing else { return }
         do {
             try recording.beginContinuing(file)
         } catch {
@@ -759,7 +771,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func endRecording() {
-        guard recordState != .idle else { return }
+        guard recordState != .idle, !transcriber.isFinishing else { return }
         stopClock()
         // 等最后一句识别完再定稿文件
         transcriber.stop { [weak self] in
@@ -768,6 +780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let name = self.recording.displayName
             let file = self.recording.url
             self.recording.end(lines: self.transcriber.lines)
+            if wrote { self.lastCompletedFile = file }
             self.updateStatusIcon()
             self.refreshSubtitle()
             if wrote, let file {
@@ -856,13 +869,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.moveToDefaultPosition()
     }
 
-    @objc private func copyAll() {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(transcriber.lines.map(\.text).joined(separator: "\n"), forType: .string)
+    /// One snapshot for copy, export and AI: includes any partial utterance and continued file prefix.
+    private func transcriptSnapshot(named name: String? = nil) throws -> TranscriptSnapshot {
+        func fail(_ message: String) -> NSError {
+            NSError(domain: "LiveCaption", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        let requested = name.flatMap { $0.isEmpty ? nil : $0 }
+        if recording.url != nil && (requested == nil || requested == recording.displayName) {
+            recording.flush(lines: transcriber.lines, partial: transcriber.labeledPartial)
+            guard let url = recording.url, let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty else {
+                throw fail("还没有字幕可分享。说话后再试。")
+            }
+            return TranscriptSnapshot(name: url.lastPathComponent, markdown: text)
+        }
+        let url: URL?
+        if let requested { url = recordingURL(named: requested) }
+        else { url = lastCompletedFile ?? transcriptFileForAI() }
+        guard let url, let text = try? String(contentsOf: url, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw fail("找不到可分享的记录。")
+        }
+        return TranscriptSnapshot(name: url.lastPathComponent, markdown: text)
     }
 
-    @objc private func saveText() { save(transcriber.plainText(), ext: "txt") }
+    @objc private func copyAll() {
+        do {
+            let snapshot = try transcriptSnapshot()
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(snapshot.plainText, forType: .string)
+            showToast("已复制全文（含时间与说话人）")
+        } catch { showToast(error.localizedDescription) }
+    }
+
+    private func exportTranscript(_ snapshot: TranscriptSnapshot, format: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = snapshot.filename(format: format)
+        panel.allowedContentTypes = [UTType(filenameExtension: format) ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try snapshot.content(format: format).write(to: url, atomically: true, encoding: .utf8)
+                self?.showToast("已导出：\(url.lastPathComponent)")
+            } catch { self?.showError(TranscriberError(message: "导出失败：\(error.localizedDescription)", settingsAnchor: nil)) }
+        }
+    }
+
+    private func exportCurrent(format: String) {
+        do { exportTranscript(try transcriptSnapshot(), format: format) }
+        catch { showToast(error.localizedDescription) }
+    }
+    @objc private func saveMarkdown() { exportCurrent(format: "md") }
+    @objc private func saveText() { exportCurrent(format: "txt") }
     @objc private func saveSRT() { save(transcriber.srt(), ext: "srt") }
 
     @objc private func clearAll() {
@@ -1103,11 +1161,14 @@ extension AppDelegate {
                 "tokens": RecordingFile.patternTokens.map { ["token": $0.token, "note": $0.note] },
             ] as [String: Any],
             "onboarding": ["show": !onboarded, "permissions": permissionStates()] as [String: Any],
+            "speakerStatus": transcriber.speakerStatus,
+            "partialSpeaker": transcriber.partialSpeaker ?? "",
             "lineCount": lines.count,
-            "lines": lines.suffix(200).map { ["time": RecordingFile.timeFormatter.string(from: $0.start), "text": $0.text] },
+            "lines": lines.suffix(200).map { ["time": RecordingFile.timeFormatter.string(from: $0.start), "text": $0.text, "speaker": $0.speaker ?? ""] },
             "partial": transcriber.partial.trimmingCharacters(in: .whitespacesAndNewlines),
             "folder": recording.folder.path,
             "settings": [
+                "speakerLabels": speakerLabels,
                 "source": source.rawValue,
                 "locale": localeID,
                 "engine": recognitionEngine.rawValue,
@@ -1257,12 +1318,18 @@ extension AppDelegate {
                 return .error(409, "保存失败：\(error.localizedDescription)")
             }
             extra["saved"] = Self.modifiedTime(url)
-        case "copy":
-            // 页面里的「复制全文」：由应用来写剪贴板，窗口里和浏览器里都能用
-            guard let url = recordingURL(named: body["name"] as? String ?? ""),
-                  let text = try? String(contentsOf: url, encoding: .utf8) else { return .error(404, "找不到这个记录文件") }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
+        case "copy", "export":
+            do {
+                let snapshot = try transcriptSnapshot(named: body["name"] as? String)
+                if action == "copy" {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(snapshot.plainText, forType: .string)
+                } else {
+                    let format = body["format"] as? String ?? "md"
+                    guard ["md", "txt"].contains(format) else { return .error(400, "仅支持 Markdown 或 TXT") }
+                    exportTranscript(snapshot, format: format)
+                }
+            } catch { return .error(409, error.localizedDescription) }
         case "preloadWhisper": preloadWhisper()
         case "debugSnapshot":
             // 调试用（启动参数 -debugSnapshot YES 才生效）：连续截几张字幕条窗口，用来检查动画
@@ -1298,6 +1365,10 @@ extension AppDelegate {
 
     private func dashboardApplySettings(_ body: [String: Any]) -> HTTPResponse {
         Log.write("控制台设置：\(body)")
+        if let enabled = body["speakerLabels"] as? Bool, enabled != speakerLabels {
+            guard recordState == .idle, !transcriber.isFinishing else { return .error(409, "请结束本次记录后再切换实时分人。") }
+            speakerLabels = enabled
+        }
         if let raw = body["source"] as? String, let kind = AudioSourceKind(rawValue: raw), kind != source {
             source = kind
             restartIfRunning()

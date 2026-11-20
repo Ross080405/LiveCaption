@@ -24,9 +24,8 @@ final class RecordingFile {
     static let partialMark = " …（识别中）"
     private var writeScheduled = false
 
-    init() {
-        folder = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/LiveCaption", isDirectory: true)
+    init(folder: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/LiveCaption", isDirectory: true)) {
+        self.folder = folder
     }
 
     var displayName: String { url?.lastPathComponent ?? "" }
@@ -215,12 +214,12 @@ final class RecordingFile {
     private func render(_ lines: [CaptionLine]) -> String {
         var out = prefix
         var markIndex = 0
-        for (i, line) in lines.enumerated() {
-            while markIndex < resumeMarks.count && resumeMarks[markIndex].index <= i {
+        for line in lines {
+            while markIndex < resumeMarks.count && resumeMarks[markIndex].date <= line.start {
                 out += "\n—— 暂停后继续：\(Self.timeFormatter.string(from: resumeMarks[markIndex].date)) ——\n\n"
                 markIndex += 1
             }
-            out += "[\(Self.timeFormatter.string(from: line.start))] \(line.text)\n"
+            out += "[\(Self.timeFormatter.string(from: line.start))] \(line.labeledText)\n"
         }
         return out
     }

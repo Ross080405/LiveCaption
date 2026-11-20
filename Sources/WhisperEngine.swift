@@ -2,6 +2,11 @@ import Foundation
 import AVFoundation
 import WhisperKit
 
+struct WhisperTranscript {
+    var text: String
+    var words: [CaptionWord]
+}
+
 struct WhisperSettings {
     let model: String
     /// Whisper 语言代码（如 "en"、"zh"）；nil = 自动检测（适合多语言混说）
@@ -131,7 +136,7 @@ final class WhisperEngine: @unchecked Sendable {
     // MARK: - 转写
 
     /// 转写一段 16kHz 单声道音频。completion 在主线程回调，失败时为 nil。
-    func transcribe(_ audio: [Float], settings: WhisperSettings, completion: @escaping (String?) -> Void) {
+    func transcribe(_ audio: [Float], settings: WhisperSettings, start: Date, completion: @escaping (WhisperTranscript?) -> Void) {
         guard let pipe else {
             Log.write("Whisper 转写：模型未加载，跳过")
             completion(nil)
@@ -146,7 +151,8 @@ final class WhisperEngine: @unchecked Sendable {
             usePrefillPrompt: true,
             detectLanguage: settings.language == nil,
             skipSpecialTokens: true,
-            withoutTimestamps: true
+            withoutTimestamps: false,
+            wordTimestamps: true
         )
         Task {
             var results: [TranscriptionResult]?
@@ -160,7 +166,18 @@ final class WhisperEngine: @unchecked Sendable {
             let text = raw.map { Self.clean($0, simplified: settings.simplifiedChinese) }
             Log.write(String(format: "Whisper 转写：音频 %.1fs，耗时 %.2fs，原始=「%@」清理后=「%@」",
                              seconds, Date().timeIntervalSince(began), raw ?? "<失败>", text ?? "<失败>"))
-            DispatchQueue.main.async { completion(text) }
+            var words = (results ?? []).flatMap(\.allWords).map { word -> CaptionWord in
+                var value = word.word
+                if settings.simplifiedChinese {
+                    value = (value as NSString).applyingTransform(StringTransform(rawValue: "Hant-Hans"), reverse: false) ?? value
+                }
+                return CaptionWord(text: value, start: start.addingTimeInterval(Double(word.start)), end: start.addingTimeInterval(Double(word.end)))
+            }
+            // Never lose punctuation or words when ASR token alignment is incomplete.
+            let joined = words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            if joined != text { words = [] }
+            let output = text.map { WhisperTranscript(text: $0, words: $0.isEmpty ? [] : words) }
+            DispatchQueue.main.async { completion(output) }
         }
     }
 
@@ -208,8 +225,8 @@ private final class ProgressMark: @unchecked Sendable {
 /// - 说话过程中每 ~0.5 秒把当前这句重新识别一次 → 实时显示（partial）
 /// - 检测到停顿 ~0.8 秒（或一句超过 25 秒）→ 最终识别这一句并定稿（commit）
 final class WhisperStreamer {
-    var onPartial: ((String) -> Void)?
-    var onCommit: ((String, Date, Date) -> Void)?
+    var onPartial: ((String, [CaptionWord]) -> Void)?
+    var onCommit: ((String, Date, Date, [CaptionWord]) -> Void)?
 
     private let settings: WhisperSettings
     private let engine = WhisperEngine.shared
@@ -342,10 +359,10 @@ final class WhisperStreamer {
             // 每多 0.5 秒新音频，就刷新一次实时字幕
             lastPartialLength = snapshot.count
             busy = true
-            engine.transcribe(snapshot, settings: settings) { [weak self] text in
+            engine.transcribe(snapshot, settings: settings, start: start) { [weak self] result in
                 guard let self else { return }
                 self.busy = false
-                if !self.finishing, let text { self.onPartial?(text) }
+                if !self.finishing, let result { self.onPartial?(result.text, result.words) }
                 if self.finishing { self.tryFinish() }
             }
         }
@@ -365,19 +382,19 @@ final class WhisperStreamer {
 
     private func commit(_ audio: [Float], start: Date, then: (() -> Void)? = nil) {
         guard audio.count >= 4_800 else {   // 不到 0.3 秒，忽略
-            onPartial?("")
+            onPartial?("", [])
             then?()
             return
         }
         let end = start.addingTimeInterval(Double(audio.count) / Self.sampleRate)
         busy = true
-        engine.transcribe(audio, settings: settings) { [weak self] text in
+        engine.transcribe(audio, settings: settings, start: start) { [weak self] result in
             guard let self else { return }
             self.busy = false
-            if let text, !text.isEmpty {
-                self.onCommit?(text, start, end)
+            if let result, !result.text.isEmpty {
+                self.onCommit?(result.text, result.words.first?.start ?? start, result.words.last?.end ?? end, result.words)
             } else {
-                self.onPartial?("")
+                self.onPartial?("", [])
             }
             if let then { then() } else if self.finishing { self.tryFinish() }
         }
@@ -399,7 +416,7 @@ final class WhisperStreamer {
         if speaking {
             commit(snapshot, start: start, then: completion)
         } else {
-            onPartial?("")
+            onPartial?("", [])
             completion()
         }
     }

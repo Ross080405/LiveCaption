@@ -1,5 +1,5 @@
 #!/bin/bash
-# 构建 LiveCaption.app（需要 Xcode 16 或更新版本）
+# 构建 LiveCaption.app（需要 Xcode 26 / Swift 6.2 或更新版本）
 set -euo pipefail
 cd "$(dirname "$0")"
 
