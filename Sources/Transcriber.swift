@@ -17,6 +17,9 @@ struct CaptionLine {
     var text: String
     let start: Date
     var end: Date
+    var speaker: String? = nil
+    var words: [CaptionWord] = []
+    var labeledText: String { speaker.map { "[\($0)] \(text)" } ?? text }
 }
 
 struct TranscriberError {
@@ -36,7 +39,28 @@ final class Transcriber: NSObject {
     var onStateChange: ((Bool) -> Void)?
     var onFatalError: ((TranscriberError) -> Void)?
 
-    private(set) var lines: [CaptionLine] = []
+    private var annotatedLines: [CaptionLine]?
+    private var rawLines: [CaptionLine] = [] { didSet { annotatedLines = nil } }
+    private var timeline = SpeakerTimeline() { didSet { annotatedLines = nil } }
+    private var speakerDiarizer: SpeakerDiarizer?
+    private var speakerEnabled = false
+    private(set) var speakerStatus = ""
+    private var partialWords: [CaptionWord] = []
+    var lines: [CaptionLine] {
+        guard speakerEnabled else { return rawLines }
+        if let annotatedLines { return annotatedLines }
+        let result = timeline.annotate(rawLines)
+        annotatedLines = result
+        return result
+    }
+    var partialSpeaker: String? {
+        guard speakerEnabled, !partial.isEmpty else { return nil }
+        if let word = partialWords.last { return timeline.label(start: word.start, end: word.end) ?? "?" }
+        return timeline.label(start: partialStart ?? Date().addingTimeInterval(-1), end: Date()) ?? "?"
+    }
+    var labeledPartial: String { partialSpeaker.map { "[\($0)] \(partial)" } ?? partial }
+    private var activeDiarizer: SpeakerDiarizer? // guarded by requestLock
+
     private(set) var partial = ""
     private(set) var isRunning = false
     private(set) var origin: Date?          // 本次记录的起点（用于导出 SRT 时间轴）
@@ -60,7 +84,7 @@ final class Transcriber: NSObject {
     private var partialStart: Date?
     private var lastPartialChange = Date()
     private var tickTimer: Timer?
-    private var finishing: [Int: (lineIndex: Int, task: SFSpeechRecognitionTask)] = [:]
+    private var finishing: [Int: (lineIndex: Int, task: SFSpeechRecognitionTask, start: Date)] = [:]
     private var consecutiveErrors = 0
 
     // 音频线程会读取当前请求，用锁保护
@@ -175,8 +199,40 @@ final class Transcriber: NSObject {
     // MARK: - 开始 / 停止
 
     func start(localeID: String, source: AudioSourceKind,
-               engine: RecognitionEngine = .apple, whisper: WhisperSettings? = nil) {
+               engine: RecognitionEngine = .apple, whisper: WhisperSettings? = nil, speakers: Bool = true) {
         guard !isRunning, !isStarting, !isFinishing else { return }
+        speakerEnabled = speakers
+        if speakers && speakerDiarizer?.ready != true {
+            isStarting = true
+            startToken += 1
+            let token = startToken
+            let diarizer = speakerDiarizer ?? SpeakerDiarizer()
+            speakerDiarizer = diarizer
+            diarizer.onStatus = { [weak self, weak diarizer] status in
+                guard let self, self.speakerDiarizer === diarizer else { return }
+                self.speakerStatus = status
+                if self.isStarting { self.statusMessage = status }
+                self.onChange?()
+            }
+            diarizer.onUpdate = { [weak self, weak diarizer] timeline in
+                guard let self, self.speakerDiarizer === diarizer else { return }
+                self.timeline = timeline
+                self.onChange?()
+            }
+            diarizer.prepare { [weak self] error in
+                guard let self, token == self.startToken else { return }
+                self.isStarting = false
+                self.statusMessage = nil
+                if let error {
+                    self.speakerStatus = "模型加载失败，可关闭实时分人后继续录音"
+                    self.onFatalError?(TranscriberError(message: "说话人模型加载失败：\(error.localizedDescription)\n可在设置关闭实时分人，或联网后重试。", settingsAnchor: nil))
+                    self.onChange?()
+                    return
+                }
+                self.start(localeID: localeID, source: source, engine: engine, whisper: whisper, speakers: speakers)
+            }
+            return
+        }
         isStarting = true
         startToken += 1
         let token = startToken
@@ -254,16 +310,17 @@ final class Transcriber: NSObject {
         if origin == nil { origin = Date() }
 
         let streamer = WhisperStreamer(settings: settings)
-        streamer.onPartial = { [weak self] text in
+        streamer.onPartial = { [weak self] text, words in
             guard let self else { return }
             if self.partial.isEmpty && !text.isEmpty { self.partialStart = Date() }
             self.partial = text
+            self.partialWords = words
             self.onChange?()
         }
-        streamer.onCommit = { [weak self] text, start, end in
+        streamer.onCommit = { [weak self] text, start, end, words in
             guard let self else { return }
             Log.write("定稿[whisper] #\(self.lines.count + 1)：\(text)")
-            self.lines.append(CaptionLine(text: text, start: start, end: end))
+            self.rawLines.append(CaptionLine(text: text, start: start, end: end, words: words))
             self.partial = ""
             self.partialStart = nil
             self.onChange?()
@@ -281,6 +338,9 @@ final class Transcriber: NSObject {
     }
 
     private func startAudioOrFail() {
+        requestLock.lock()
+        activeDiarizer = speakerEnabled ? speakerDiarizer : nil
+        requestLock.unlock()
         startAudio { [weak self] error in
             guard let self else { return }
             if let error {
@@ -293,6 +353,28 @@ final class Transcriber: NSObject {
 
     /// 停止识别。completion 在所有文字都定稿后调用（Whisper 需要再识别完最后一句）。
     func stop(completion: (() -> Void)? = nil) {
+        if isFinishing {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.stop(completion: completion) }
+            return
+        }
+        stopRecognition { [weak self] in
+            guard let self else { completion?(); return }
+            self.requestLock.lock()
+            let diarizer = self.activeDiarizer
+            self.activeDiarizer = nil
+            self.requestLock.unlock()
+            guard let diarizer else { completion?(); return }
+            self.isFinishing = true
+            self.onChange?()
+            diarizer.drain { [weak self] in
+                self?.isFinishing = false
+                self?.onChange?()
+                completion?()
+            }
+        }
+    }
+
+    private func stopRecognition(completion: (() -> Void)? = nil) {
         if isStarting {
             // 还在请求权限或加载模型：取消这次开始
             startToken += 1
@@ -339,15 +421,34 @@ final class Transcriber: NSObject {
         }
 
         finishSegment()
+        isFinishing = true
         onStateChange?(false)
         onChange?()
-        completion?()
+        finishAppleStop(deadline: Date().addingTimeInterval(5.1), completion: completion)
+    }
+
+    private func finishAppleStop(deadline: Date, completion: (() -> Void)?) {
+        if finishing.isEmpty || Date() >= deadline {
+            for entry in finishing.values { entry.task.cancel() }
+            finishing.removeAll()
+            isFinishing = false
+            onChange?()
+            completion?()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.finishAppleStop(deadline: deadline, completion: completion)
+            }
+        }
     }
 
     func clear() {
         for entry in finishing.values { entry.task.cancel() }
         finishing.removeAll()
-        lines.removeAll()
+        rawLines.removeAll()
+        timeline = SpeakerTimeline()
+        speakerDiarizer = nil
+        speakerStatus = ""
+        partialWords = []
         origin = isRunning ? Date() : nil
         onChange?()
     }
@@ -526,9 +627,11 @@ final class Transcriber: NSObject {
         requestLock.lock()
         let request = currentRequest
         let streamer = activeStreamer
+        let diarizer = activeDiarizer
         requestLock.unlock()
         request?.append(buffer)
         streamer?.append(buffer)
+        diarizer?.append(buffer)
     }
 
     // MARK: - 分段识别
@@ -558,6 +661,7 @@ final class Transcriber: NSObject {
         lastPartialChange = Date()
         partial = ""
         partialStart = nil
+        partialWords = []
 
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             DispatchQueue.main.async {
@@ -577,9 +681,9 @@ final class Transcriber: NSObject {
         let text = partial.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty, let task {
             Log.write("定稿[apple] #\(lines.count + 1)：\(text)")
-            lines.append(CaptionLine(text: text, start: partialStart ?? sessionStart, end: Date()))
+            rawLines.append(CaptionLine(text: text, start: partialWords.first?.start ?? partialStart ?? sessionStart, end: partialWords.last?.end ?? Date(), words: partialWords))
             let id = sessionID
-            finishing[id] = (lines.count - 1, task)
+            finishing[id] = (rawLines.count - 1, task, sessionStart)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
                 if let entry = self?.finishing.removeValue(forKey: id) { entry.task.cancel() }
             }
@@ -614,8 +718,9 @@ final class Transcriber: NSObject {
             guard let entry = finishing[id] else { return }
             if let result {
                 let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty, entry.lineIndex < lines.count, lines[entry.lineIndex].text != text {
-                    lines[entry.lineIndex].text = text
+                if !text.isEmpty, entry.lineIndex < rawLines.count {
+                    rawLines[entry.lineIndex].text = text
+                    rawLines[entry.lineIndex].words = timedWords(result.bestTranscription, base: entry.start)
                     onChange?()
                 }
                 if result.isFinal { finishing.removeValue(forKey: id) }
@@ -629,9 +734,10 @@ final class Transcriber: NSObject {
             consecutiveErrors = 0
             if isOnDevice { onDeviceGotResult = true; onDeviceFailures = 0 }
             let text = result.bestTranscription.formattedString
+            partialWords = timedWords(result.bestTranscription, base: sessionStart)
             if text != partial {
                 if partial.isEmpty {
-                    partialStart = Date()
+                    partialStart = partialWords.first?.start ?? Date()
                     Log.write(String(format: "段#%d 首个实时结果（开段后 %.1fs）：%@", id, Date().timeIntervalSince(sessionStart), text))
                 }
                 partial = text
@@ -681,12 +787,24 @@ final class Transcriber: NSObject {
         }
     }
 
+    private func timedWords(_ transcription: SFTranscription, base: Date) -> [CaptionWord] {
+        let text = transcription.formattedString as NSString
+        return transcription.segments.enumerated().compactMap { i, segment in
+            let lo = i == 0 ? 0 : segment.substringRange.location
+            let hi = i + 1 < transcription.segments.count ? transcription.segments[i + 1].substringRange.location : text.length
+            guard lo >= 0, hi >= lo, hi <= text.length else { return nil }
+            return CaptionWord(text: text.substring(with: NSRange(location: lo, length: hi - lo)),
+                               start: base.addingTimeInterval(segment.timestamp),
+                               end: base.addingTimeInterval(segment.timestamp + segment.duration))
+        }
+    }
+
     // MARK: - 导出
 
     func plainText() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        return lines.map { "[\(formatter.string(from: $0.start))] \($0.text)" }.joined(separator: "\n") + "\n"
+        return lines.map { "[\(formatter.string(from: $0.start))] \($0.labeledText)" }.joined(separator: "\n") + "\n"
     }
 
     func srt() -> String {
@@ -699,7 +817,7 @@ final class Transcriber: NSObject {
         for (i, line) in lines.enumerated() {
             let start = line.start.timeIntervalSince(base)
             let end = max(line.end.timeIntervalSince(base), start + 1)
-            out += "\(i + 1)\n\(stamp(start)) --> \(stamp(end))\n\(line.text)\n\n"
+            out += "\(i + 1)\n\(stamp(start)) --> \(stamp(end))\n\(line.labeledText)\n\n"
         }
         return out
     }

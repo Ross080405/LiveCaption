@@ -284,6 +284,10 @@ button.big { font-size: 16px; padding: 12px 26px; }
 #live-lines .cue.settle p { animation: settle 0.6s ease both; }
 @keyframes settle { 0% { color: color-mix(in srgb, var(--ink) 55%, transparent); } 100% { color: var(--ink); } }
 @media (prefers-reduced-motion: reduce) { .w { transition: none; } #live-lines .cue.settle p, #live-partial p::after { animation: none; } }
+.share-tools { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:12px; }
+.speaker-badge { display:inline-block; font-size:12px; font-weight:700; color:var(--accent, #315fca); background:rgba(70,110,220,.1); border-radius:6px; padding:1px 7px; margin-right:8px; vertical-align:middle; }
+.reader-share { margin:0 0 22px; padding-bottom:18px; border-bottom:1px solid var(--line); }
+.speaker-status { font-size:12px; color:var(--muted); margin-top:8px; }
 </style>
 </head>
 <body>
@@ -324,6 +328,8 @@ button.big { font-size: 16px; padding: 12px 26px; }
           <select id="q-source" aria-label="音频来源"></select>
           <select id="q-locale" aria-label="识别语言"></select>
         </div>
+        <label class="help"><input type="checkbox" id="q-speakers"> 实时区分说话人 A / B / C / D</label>
+        <p class="help">本机分人 · 最多 4 人 · 首次下载模型 · 标签会稍后校正</p>
         <div class="name-hint"><span id="name-hint"></span> · <button class="link" id="name-mode"></button></div>
         <div class="stage-foot"><button class="link" id="stage-lib"></button></div>
       </div>
@@ -338,6 +344,13 @@ button.big { font-size: 16px; padding: 12px 26px; }
           </div>
           <div class="session-status" id="s-status"></div>
           <div class="meter" id="meter"><i></i></div>
+          <div class="speaker-status" id="speaker-status"></div>
+          <div class="share-tools">
+            <button id="live-copy">复制全文</button>
+            <button id="live-md">导出 Markdown</button>
+            <button id="live-txt">导出 TXT</button>
+            <span class="help">含时间与说话人；未定稿文字标为「识别中」</span>
+          </div>
         </div></div>
         <div class="doc" id="live-doc">
           <div id="live-lines"></div>
@@ -359,12 +372,18 @@ button.big { font-size: 16px; padding: 12px 26px; }
         <button class="ghost" id="r-edit" title="直接修改这份记录的文字">编辑</button>
         <button class="ghost" id="r-cancel" hidden>取消</button>
         <button class="primary" id="r-save" hidden title="保存（⌘S）">保存</button>
-        <button class="ghost" id="r-copy">复制全文</button>
+
         <button class="ghost" id="r-continue">接着写入</button>
         <button class="ghost" id="r-reveal">在访达中显示</button>
         <button class="ghost danger" id="r-trash">移到废纸篓</button>
       </div>
       <div class="reader-card">
+        <div class="share-tools reader-share" id="reader-share">
+          <span class="help">分享 transcript</span>
+          <button class="primary" id="r-copy">复制全文</button>
+          <button id="r-md">导出 Markdown</button>
+          <button id="r-txt">导出 TXT</button>
+        </div>
         <div class="reader-meta" id="r-meta"></div>
         <div class="reader-title" id="r-title"></div>
         <div class="doc" id="r-doc"></div>
@@ -395,6 +414,8 @@ button.big { font-size: 16px; padding: 12px 26px; }
   <div class="group">
   <div class="row"><label for="source">音频来源</label><select id="source"></select></div>
   <div class="row"><label for="locale">识别语言</label><select id="locale"></select></div>
+  <div class="row"><label for="speakerLabels">实时区分说话人 A/B/C/D</label><span class="switch"><input type="checkbox" id="speakerLabels"><i></i></span></div>
+  <p class="help" style="padding:0 16px 12px">最多 4 人，按声音自动分组。标签会稍晚出现并校正；? 表示尚未确定，A+B 表示重叠发言。新记录重新编号；暂停后保留。结束记录后可切换。</p>
   <div class="row" style="display:block"><div id="engines"></div></div>
   </div>
 
@@ -491,6 +512,11 @@ function inline(source) {
        .replace(/~~([^~]+)~~/g, '<del>$1</del>');
   return s.replace(/\u0001(\d+)\u0001/g, (m, i) => '<code>' + codes[i] + '</code>');
 }
+function captionMarkup(text) {
+  const match = text.match(/^\[([A-D?](?:\+[A-D])?)\]\s*(.*)$/);
+  if (!match) return inline(text);
+  return '<span class="speaker-badge">' + (match[1] === '?' ? '待识别' : '说话人 ' + match[1]) + '</span>' + inline(match[2]);
+}
 const CUE = /^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$/;
 const SEP = /^——\s*(.+?)\s*——$/;
 const LIST = /^\s*([-*+]|\d+[.)])\s+(.*)$/;
@@ -518,7 +544,7 @@ function markdown(text) {
       out.push('<div class="sep">' + inline(m[1]) + '</div>'); i++;
     } else if ((m = trimmed.match(CUE))) {
       const pending = m[2].endsWith(' …（识别中）');
-      out.push('<div class="cue' + (pending ? ' partial' : '') + '"><time>' + m[1] + '</time><p>' + inline(pending ? m[2].slice(0, -7) + ' …' : m[2]) + '</p></div>'); i++;
+      out.push('<div class="cue' + (pending ? ' partial' : '') + '"><time>' + m[1] + '</time><p>' + captionMarkup(pending ? m[2].slice(0, -7) + ' …' : m[2]) + '</p></div>'); i++;
     } else if (/^>/.test(trimmed)) {
       const quote = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) quote.push(lines[i++].replace(/^\s*>\s?/, ''));
@@ -613,6 +639,8 @@ function render(state) {
       if (state.state === 'recording') add('暂停', 'pause', 'primary'); else add('继续', 'resume', 'primary');
       add('结束', 'end', '');
     }
+    $('speaker-status').textContent = state.settings.speakerLabels ? (state.speakerStatus || '实时分人 · 等待声音') : '实时分人已关闭';
+    for (const id of ['live-copy', 'live-md', 'live-txt']) $(id).disabled = !state.lineCount && !state.partial;
     const dead = state.running && !state.receiving;
     $('meter').classList.toggle('dead', dead);
     $('meter').firstElementChild.style.width = (state.running ? Math.round(state.level * 100) : 0) + '%';
@@ -622,12 +650,12 @@ function render(state) {
       : busy ? stateLabel
       : state.running && state.level < 0.1 ? '在听，但现在很安静' : '';
 
-    const liveSig = state.lineCount + '|' + state.partial + '|' + state.status + '|' + (state.lines.length ? state.lines[state.lines.length - 1].text : '');
+    const liveSig = JSON.stringify([state.lines, state.partial, state.partialSpeaker, state.status]);
     if (liveSig !== lastLiveSig) {
       lastLiveSig = liveSig;
       const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80;
       renderLiveLines(state);
-      renderPartial(state.partial);
+      renderPartial((state.partialSpeaker ? '[' + state.partialSpeaker + '] ' : '') + state.partial);
       const note = state.status || (!state.lines.length && !state.partial && state.running ? '正在聆听…说的话会出现在这里。' : '');
       $('live-note').hidden = !note;
       $('live-note').textContent = note;
@@ -644,7 +672,8 @@ function render(state) {
   if (!active) { lastButtonsSig = ''; lastLiveSig = ''; }
 
   // 阅读视图里「接着写入」只在空闲时可用
-  $('r-continue').disabled = active;
+  $('r-continue').disabled = active || state.finishing;
+  $('q-speakers').checked = state.settings.speakerLabels;
 
   if (state.error && state.error.id !== dismissedError) { $('banner').dataset.id = state.error.id; showBanner(state.error.message); }
 
@@ -719,18 +748,20 @@ function renderOnboarding(state) {
 // 已定稿的句子：只增量更新，新的一句「落定」时气泡亮一下
 function renderLiveLines(state) {
   const box = $('live-lines');
-  const base = state.lineCount - state.lines.length;          // 第一行在整场记录里的序号
-  const fresh = box.dataset.base !== String(base) || box.childElementCount > state.lines.length;
-  if (fresh) { box.replaceChildren(); box.dataset.base = base; }
-  const animate = !fresh || state.lines.length <= 1;          // 刚打开页面时已有的句子不用动画
+  const base = state.lineCount - state.lines.length;
+  if (box.dataset.base !== String(base) || box.childElementCount > state.lines.length) {
+    box.replaceChildren(); box.dataset.base = base;
+  }
   state.lines.forEach((line, i) => {
     let row = box.children[i];
-    if (!row) {
-      row = el('div', 'cue' + (animate ? ' settle' : ''));
-      row.append(el('time', '', line.time), el('p', '', line.text));
-      box.append(row);
-    } else if (row.lastElementChild.textContent !== line.text) {
-      row.lastElementChild.textContent = line.text;           // 后台校正了上一句
+    if (!row) { row = el('div', 'cue'); row.append(el('time'), el('p')); box.append(row); }
+    row.firstElementChild.textContent = line.time;
+    const signature = JSON.stringify([line.speaker, line.text]);
+    if (row.dataset.sig !== signature) {
+      row.dataset.sig = signature;
+      const p = row.lastElementChild; p.replaceChildren();
+      if (line.speaker) p.append(el('span', 'speaker-badge', line.speaker === '?' ? '待识别' : '说话人 ' + line.speaker));
+      p.append(document.createTextNode(line.text));
     }
   });
 }
@@ -762,6 +793,8 @@ function renderPartial(text) {
 
 function renderSettings(state) {
   const s = state.settings, o = state.options, n = state.naming;
+  $('speakerLabels').checked = s.speakerLabels;
+  $('speakerLabels').disabled = state.state !== 'idle' || state.finishing;
   fillSeg($('namingMode'), [{ value: 'pattern', name: '自动命名' }, { value: 'ask', name: '开始前先起名' }], n.mode, v => setting({ namingMode: v }));
   if (document.activeElement !== $('pattern')) $('pattern').value = n.pattern;
   $('pattern-note').textContent = n.mode === 'ask' ? '先起名时，名字留空就按这条规则来。' : '重名时会自动加上 (2)、(3)。记录开始后点标题可以随时改名。';
@@ -908,7 +941,9 @@ function renderReader() {
   $('r-editor').hidden = !editing;
   $('r-edit').hidden = editing || !canEdit;
   $('r-save').hidden = $('r-cancel').hidden = !editing;
+  $('reader-share').hidden = editing;
   for (const id of ['r-font', 'r-time', 'r-copy']) $(id).hidden = editing;
+  for (const id of ['r-md', 'r-txt']) $(id).hidden = editing || !!doc.local;
   for (const id of ['r-continue', 'r-reveal', 'r-trash']) $(id).hidden = editing || !!doc.local;
   $('r-trash').disabled = !!(rec && rec.active);
   $('r-font').classList.toggle('on', document.body.classList.contains('serif'));
@@ -991,6 +1026,13 @@ $('name-mode').onclick = async () => {
 };
 $('q-source').onchange = e => setting({ source: e.target.value });
 $('q-locale').onchange = e => setting({ locale: e.target.value });
+$('q-speakers').onchange = e => setting({ speakerLabels: e.target.checked });
+$('speakerLabels').onchange = e => setting({ speakerLabels: e.target.checked });
+$('live-copy').onclick = async () => { if (await act('copy')) toast('已复制全文（含时间与说话人）'); };
+$('live-md').onclick = () => act('export', { format: 'md' });
+$('live-txt').onclick = () => act('export', { format: 'txt' });
+$('r-md').onclick = () => act('export', { name: doc.name, format: 'md' });
+$('r-txt').onclick = () => act('export', { name: doc.name, format: 'txt' });
 $('source').onchange = e => setting({ source: e.target.value });
 $('locale').onchange = e => setting({ locale: e.target.value });
 $('stage-lib').onclick = () => setLibrary(true);
